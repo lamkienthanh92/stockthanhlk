@@ -3244,25 +3244,98 @@ function runProfitViewsWalkForward(
 }
 
 // ============================================================
+// CMT trên khung TUẦN — cổ phiếu VN nên định hướng/kịch bản/TP ở khung lớn
+// hơn (ổn định, ít nhiễu) rồi mới xuống ngày để bắt điểm vào. Mỗi ngày dùng
+// R/S/target của TUẦN TRƯỚC đã đóng hoàn chỉnh (không dùng tuần đang chạy
+// — tránh nhìn trước dữ liệu chưa xảy ra).
+function buildWeeklyCMT(closes, highs, lows, dates) {
+  const n = closes.length;
+  const H_ = highs || closes,
+    L_ = lows || closes;
+  const wk = aggWeekly(closes, dates);
+  const wkHL = aggWeeklyHL(H_, L_, dates);
+  const nw = wk.closes.length;
+
+  // Ngày → chỉ số tuần chứa ngày đó (đúng quy tắc nhóm tuần Monday-start
+  // như aggWeekly đang dùng ở những nơi khác trong app).
+  const dayWeekIdx = Array(n).fill(0);
+  let w = -1,
+    curKey = null;
+  for (let i = 0; i < n; i++) {
+    const dt = new Date(dates[i] + "T00:00:00Z");
+    const day = (dt.getUTCDay() + 6) % 7;
+    const mon = new Date(dt);
+    mon.setUTCDate(dt.getUTCDate() - day);
+    const key = mon.toISOString().slice(0, 10);
+    if (key !== curKey) {
+      w++;
+      curKey = key;
+    }
+    dayWeekIdx[i] = w;
+  }
+
+  // Pivot tuần (xác nhận sau 2 tuần — cùng quy ước Dow theory tuần dùng ở
+  // Module 1) → R/S/hướng/target y hệt logic CMT hàng ngày nhưng ở cấp tuần.
+  const pivW = pivots(wk.closes, 2, wkHL.highs, wkHL.lows);
+  let pw = 0;
+  const WH = [],
+    WL = [];
+  const weekState = Array(nw).fill(null),
+    weekTarget = Array(nw).fill(null),
+    weekR = Array(nw).fill(null),
+    weekS = Array(nw).fill(null);
+  for (let ww = 0; ww < nw; ww++) {
+    while (pw < pivW.length && pivW[pw].i + 2 <= ww) {
+      (pivW[pw].type === "H" ? WH : WL).push(pivW[pw]);
+      pw++;
+    }
+    const c = wk.closes[ww];
+    const overhead = WH.filter((p) => p.price > c).map((p) => p.price);
+    const below = WL.filter((p) => p.price < c).map((p) => p.price);
+    const w10H = wkHL.highs.slice(Math.max(0, ww - 10), ww),
+      w10L = wkHL.lows.slice(Math.max(0, ww - 10), ww);
+    if (!w10H.length) continue;
+    const R = overhead.length ? Math.min(...overhead) : Math.max(...w10H);
+    const S = below.length ? Math.max(...below) : Math.min(...w10L);
+    const range = Math.max(R - S, 1e-9);
+    weekR[ww] = R;
+    weekS[ww] = S;
+    if (c > R) {
+      weekState[ww] = "RUN_UP";
+      weekTarget[ww] = R + 0.618 * range;
+    } else if (c < S) {
+      weekState[ww] = "RUN_DOWN";
+      weekTarget[ww] = null;
+    } else {
+      weekState[ww] = "IN_RANGE";
+      weekTarget[ww] = R;
+    }
+  }
+
+  return { dayWeekIdx, weekState, weekTarget, weekR, weekS, weekDates: wk.dates, nw };
+}
+
+// ============================================================
 // LUẬT GIAO DỊCH CMT × HURST — dùng chung cho backtest lịch sử VÀ
 // trạng thái "đang sống" hiển thị trên Bộ lọc. Hoàn toàn nhân quả
 // (không nhìn trước), chỉ Long (TTCK VN không bán khống):
 //
-//  (1) CMT xác định HƯỚNG + TP: R/S lấy từ pivot đỉnh/đáy thật gần nhất
-//      (rơi về cao/thấp 40 phiên nếu chưa có pivot phù hợp).
-//        · Đã breakout lên (giá đóng cửa > R): TP = R + 0.618×(R−S)
-//        · Đang trong biên: TP = R (kháng cự)
-//        · Breakout xuống (giá đóng cửa < S): KHÔNG vào lệnh
+//  (1) CMT xác định HƯỚNG + TP trên KHUNG TUẦN (ổn định hơn khung ngày):
+//      R/S lấy từ pivot đỉnh/đáy tuần gần nhất, dùng tuần TRƯỚC đã đóng.
+//        · Tuần đã breakout lên (đóng tuần > R tuần): TP = R + 0.618×(R−S)
+//        · Tuần đang trong biên: TP = R tuần (kháng cự)
+//        · Tuần breakout xuống: KHÔNG vào lệnh
 //  (2) Hurst xác định regime Trend/Range của NGÀY quyết định → chọn đúng
 //      bộ chỉ báo tương ứng (22 Trend kể cả Volume, hoặc 20 Range) để
 //      lấy tín hiệu đồng thuận (net trung bình dấu, không lọc walk-forward
 //      để tính được nhanh cho cả 30 mã).
-//  (3) Vào lệnh khi đồng thuận bộ chỉ báo đang NGHIÊNG MUA (> ngưỡng) VÀ
-//      giá phiên quyết định vừa giảm so với phiên trước đó (mua theo nhịp
-//      giảm trong xu hướng/biên đã xác định ở (1)+(2)).
-//      SL = entry − ATR(period)×slMult. Thoát khi High chạm TP, Low chạm
-//      SL (quét thật trong phiên), hết thời gian giữ tối đa, hoặc CMT tự
-//      chuyển sang cảnh báo giảm khi đang giữ (bảo vệ vốn).
+//  (3) Xuống khung NGÀY để bắt điểm vào: đồng thuận bộ chỉ báo đang NGHIÊNG
+//      MUA (> ngưỡng) VÀ giá phiên quyết định vừa giảm so với phiên trước
+//      (mua theo nhịp giảm trong hướng/biên đã xác định ở (1)+(2)).
+//      SL = entry − ATR(period)×slMult (khung ngày, bắt điểm chính xác).
+//      Thoát khi High chạm TP tuần, Low chạm SL (quét thật trong phiên),
+//      hết thời gian giữ tối đa, hoặc hỗ trợ TUẦN bị phá khi đang giữ
+//      (bảo vệ vốn — kịch bản tuần đã đổi).
 // ============================================================
 const ENTRY_CONSENSUS_THR = 0.2;
 
@@ -3274,6 +3347,9 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     highs && lows
       ? atrTrue(highs, lows, closes, opts.atrPeriod)
       : closeATR(closes, opts.atrPeriod);
+
+  // (1) CMT khung TUẦN — hướng, R/S, target cho toàn bộ lịch sử một lần
+  const wCMT = buildWeeklyCMT(closes, highs, lows, dates);
 
   // (2) Hurst phase — phân loại nhanh (buffer/stableWin cố định, không dò
   // walk-forward) để tính được cho cả rổ 30 mã mà không quá nặng.
@@ -3298,10 +3374,6 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     return c ? s / c : 0;
   };
 
-  const piv = pivots(closes, 4, highs, lows);
-  let pi = 0;
-  const H = [],
-    L = [];
   const trades = [];
   let pos = null;
   const maxHold = opts.cardMaxHold || 30;
@@ -3316,11 +3388,14 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
         c = closes[i];
       const hitTP = hi >= pos.tp;
       const hitSL = lo <= pos.stop;
-      const S40now = Math.min(...L_.slice(Math.max(0, i - 40), i));
-      const flipDown = c < S40now; // bảo vệ vốn: CMT đã cảnh báo breakdown
+      // Bảo vệ vốn theo khung TUẦN: nếu hỗ trợ của tuần trước đã bị giá
+      // đóng cửa phá — kịch bản tuần đã đổi, không chờ SL ngày nữa.
+      const ww = wCMT.dayWeekIdx[i] - 1;
+      const wS = ww >= 0 ? wCMT.weekS[ww] : null;
+      const flipDown = wS != null && c < wS;
       if (hitTP || hitSL || flipDown || i - pos.i0 >= maxHold) {
         const stoppedOut = hitSL || flipDown;
-        const exit = hitSL ? pos.stop : hitTP ? pos.tp : flipDown ? c : c;
+        const exit = hitSL ? pos.stop : hitTP ? pos.tp : c;
         trades.push({
           entryIdx: pos.i0,
           exitIdx: i,
@@ -3343,35 +3418,17 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     }
     if (pos || justExited) continue;
 
-    // (b) Xác nhận pivot tới ngày quyết định j = i-1 (chỉ dùng dữ liệu đã biết)
+    // (b) Ngày quyết định j = i-1 (chỉ dùng dữ liệu đã biết)
     const j = i - 1;
-    while (pi < piv.length && piv[pi].i + 4 <= j) {
-      (piv[pi].type === "H" ? H : L).push(piv[pi]);
-      pi++;
-    }
     const lastC = closes[j];
-    const overhead = H.filter((p) => p.price > lastC).map((p) => p.price);
-    const below = L.filter((p) => p.price < lastC).map((p) => p.price);
-    const w40H = H_.slice(Math.max(0, j - 40), j),
-      w40L = L_.slice(Math.max(0, j - 40), j);
-    if (!w40H.length) continue;
-    const R = overhead.length ? Math.min(...overhead) : Math.max(...w40H);
-    const S = below.length ? Math.max(...below) : Math.min(...w40L);
-    const range = Math.max(R - S, 1e-9);
 
-    // (1) CMT: hướng + target
-    let state, target;
-    if (lastC > R) {
-      state = "RUN_UP";
-      target = R + 0.618 * range;
-    } else if (lastC < S) {
-      state = "RUN_DOWN";
-      target = null;
-    } else {
-      state = "IN_RANGE";
-      target = R;
-    }
-    if (state === "RUN_DOWN" || target == null || target <= lastC) continue;
+    // (1) CMT khung TUẦN: hướng + target — lấy tuần TRƯỚC tuần chứa ngày j
+    // (tuần chứa j có thể chưa đóng xong, không dùng để tránh nhìn trước)
+    const wIdx = wCMT.dayWeekIdx[j] - 1;
+    if (wIdx < 0) continue;
+    const state = wCMT.weekState[wIdx];
+    const target = wCMT.weekTarget[wIdx];
+    if (!state || state === "RUN_DOWN" || target == null || target <= lastC) continue;
 
     // (2) Hurst chọn bộ chỉ báo theo regime của ngày j
     const ph = phase[j];
@@ -3379,7 +3436,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     if (!pool) continue;
     const consensus = netAt(pool, j);
 
-    // (3) Đồng thuận mua + giá vừa giảm → vào lệnh
+    // (3) Xuống khung ngày bắt điểm vào: đồng thuận mua + giá vừa giảm
     const pulledBack = j >= 1 && closes[j] < closes[j - 1];
     if (consensus > ENTRY_CONSENSUS_THR && pulledBack) {
       const a = atr[j];
@@ -5012,7 +5069,7 @@ function LiveDeskPanel({ rows, openStock }) {
     (r) => r.live && !r.live.active && r.live.lastExit && r.live.lastExit.exitedToday
   );
   const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
-  const stateVN = { RUN_UP: "breakout", IN_RANGE: "trong biên" };
+  const stateVN = { RUN_UP: "breakout tuần", IN_RANGE: "trong biên tuần" };
   const fmtPct = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
   return (
     <Panel
@@ -5020,7 +5077,7 @@ function LiveDeskPanel({ rows, openStock }) {
       title={`Đang giữ ${holding.length} mã${
         openedToday.length ? ` · mở mới hôm nay ${openedToday.length}` : ""
       }${closedToday.length ? ` · đóng hôm nay ${closedToday.length}` : ""}`}
-      sub="Luật: (1) CMT xác định hướng + TP theo R/S thật · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) vào lệnh khi bộ chỉ báo đồng thuận mua và giá vừa giảm (mua theo nhịp). SL = ATR×hệ số. Chỉ Long."
+      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG TUẦN (dùng tuần trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. SL = ATR ngày×hệ số. Chỉ Long."
     >
       {holding.length === 0 ? (
         <p className="sub">
@@ -7863,17 +7920,17 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
           ts = cb.tradeStats,
           wl = cb.winLoss;
         const scenName = {
-          RUN_UP: "Mua theo pullback trong breakout",
-          IN_RANGE: "Mua theo pullback trong biên",
+          RUN_UP: "Mua theo pullback ngày, tuần đang breakout",
+          IN_RANGE: "Mua theo pullback ngày, tuần đang trong biên",
         };
         const scenRows = Object.entries(cb.byScen).sort((a, b) => b[1].n - a[1].n);
         const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
-        const stateVN2 = { RUN_UP: "breakout", IN_RANGE: "trong biên" };
+        const stateVN2 = { RUN_UP: "breakout tuần", IN_RANGE: "trong biên tuần" };
         return (
           <Panel
             mod="Hurst · Backtest theo luật CMT × Hurst"
             title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
-            sub={`Luật: (1) CMT xác định hướng + TP theo R/S thật · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. SL = ATR×${opts.slMult.toFixed(
+            sub={`Luật: (1) CMT xác định hướng + TP trên KHUNG TUẦN (tuần trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. SL = ATR ngày×${opts.slMult.toFixed(
               1
             )}. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
           >
@@ -7982,7 +8039,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                 </div>
                 <div className="grid2" style={{ marginTop: 14 }}>
                   <div>
-                    <div className="sub" style={{ marginBottom: 4 }}>Theo bối cảnh CMT lúc vào</div>
+                    <div className="sub" style={{ marginBottom: 4 }}>Theo bối cảnh CMT tuần lúc vào</div>
                     <table className="tbl">
                       <thead>
                         <tr><th>Loại lệnh</th><th>Số</th><th>Thắng</th><th>Tổng R</th></tr>
