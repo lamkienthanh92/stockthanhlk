@@ -72,7 +72,7 @@ def get_stock_history(
     start: str = Query(..., description="YYYY-MM-DD"),
     end: str = Query(..., description="YYYY-MM-DD"),
     interval: str = Query("1D", description="1D, 1W, 1M"),
-    source: str = Query("VCI", description="VCI, TCBS, MSN, ..."),
+    source: str = Query("TCBS", description="VCI, TCBS, MSN, ..."),
 ):
     symbol = symbol.upper()
     key = f"stock:{symbol}:{start}:{end}:{interval}:{source}"
@@ -106,7 +106,7 @@ def get_index_history(
 
     def loader():
         try:
-            stock = Vnstock().stock(symbol=code, source="VCI")
+            stock = Vnstock().stock(symbol=code, source="TCBS")
             df = stock.quote.history(start=start, end=end)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"vnstock error: {exc}") from exc
