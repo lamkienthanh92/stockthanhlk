@@ -5792,7 +5792,7 @@ function StructureLayer({ dates, closes, highs, lows, digits, patterns, scens, s
       <Panel
         mod="Module 2 · Elliott Wave"
         title="Kịch bản đếm sóng song song"
-        sub="Đếm sóng mang tính chủ quan cao — hệ thống trình bày các kịch bản khả dĩ kèm xác suất tương đối, không khẳng định một đáp án."
+        sub="Đếm sóng ở KHUNG TUẦN (ổn định hơn ngày) — mang tính chủ quan cao, hệ thống trình bày các kịch bản khả dĩ kèm xác suất tương đối, không khẳng định một đáp án."
       >
         {swings && swings.cur && swings.up.n > 0 && swings.down.n > 0 && (
           <div className="scen" style={{ borderColor: "rgba(233,180,76,.4)" }}>
@@ -5857,7 +5857,7 @@ function StructureLayer({ dates, closes, highs, lows, digits, patterns, scens, s
       <Panel
         mod="Module 2 · Chart Patterns"
         title="Mẫu hình cổ điển đang theo dõi"
-        sub="Nhận diện từ đỉnh/đáy High/Low thật; target đo bằng chiều cao mẫu hình."
+        sub="Nhận diện ở KHUNG TUẦN từ đỉnh/đáy High/Low thật; target đo bằng chiều cao mẫu hình."
       >
         {patterns.length === 0 && (
           <p className="sub">
@@ -5897,7 +5897,7 @@ function StructureLayer({ dates, closes, highs, lows, digits, patterns, scens, s
           </div>
         ))}
       </Panel>
-      <Panel mod="Biểu đồ" title="Khung ngày — overlay nhãn sóng & neckline">
+      <Panel mod="Biểu đồ" title="Khung tuần — overlay nhãn sóng & neckline">
         <PriceChart
           dates={dates}
           closes={closes}
@@ -6487,7 +6487,7 @@ function PlaybookLayer({ cfg, pb, dates, closes, highs, lows, digits, ma50, ma20
       <Panel
         mod="Tổng hợp workflow"
         title={`Kịch bản giao dịch — ${cfg.label}`}
-        sub="Đầu ra của trình tự CMT: giá đang kẹt giữa hỗ trợ và kháng cự xác định từ pivot thật; mỗi nhánh là một kế hoạch if-then với trigger, target, mức vô hiệu và bằng chứng trích từ đúng lớp phân tích sinh ra nó."
+        sub="Đầu ra của trình tự CMT: hỗ trợ/kháng cự và kịch bản A·B·C xác định từ pivot TUẦN thật (ổn định hơn ngày); mỗi nhánh là một kế hoạch if-then với trigger, target, mức vô hiệu và bằng chứng trích từ đúng lớp phân tích sinh ra nó. Giá hiện tại vẫn cập nhật theo từng phiên ngày."
       >
         <div
           style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}
@@ -8201,6 +8201,8 @@ function buildCMTModel(closes, volumes, dates, cfg, highs, lows) {
   const moHL = aggMonthlyHL(H_, L_, dates);
   wk.highs = wkHL.highs;
   wk.lows = wkHL.lows;
+  wk.ma50 = sma(wk.closes, 50);
+  wk.ma200 = sma(wk.closes, 200);
   mo.highs = moHL.highs;
   mo.lows = moHL.lows;
   const pivD = pivots(closes, 4, highs, lows);
@@ -8218,15 +8220,19 @@ function buildCMTModel(closes, volumes, dates, cfg, highs, lows) {
   };
   const cascade = stepDownCascade(closes, dates, highs, lows);
 
-  const vp = volProxy(closes);
-  const av = vp[vp.length - 1];
-  const winN = Math.min(160, closes.length);
-  const winCloses = closes.slice(-winN),
-    winDates = dates.slice(-winN);
-  const winHighs = H_.slice(-winN),
-    winLows = L_.slice(-winN);
-  const pivWin = pivots(winCloses, 4, winHighs, winLows);
-  const patterns = detectPatterns(winCloses, pivWin, av * 3, cfg.digits);
+  // Kịch bản (Elliott, mẫu hình, Playbook A/B/C) tính trên khung TUẦN — ổn
+  // định hơn, đúng ý "CMT ở khung lớn, chỉ xuống ngày để bắt điểm vào".
+  // Riêng lớp xác nhận (Module 3: RSI/MACD/MA) và giá "hiện tại" vẫn lấy
+  // từ khung ngày, vì đó là trạng thái tức thời cần theo dõi từng phiên.
+  const av = volProxy(closes).slice(-1)[0] ?? 0;
+  const avW = volProxy(wk.closes).slice(-1)[0] ?? 0;
+  const winWeeks = Math.min(120, wk.closes.length);
+  const winCloses = wk.closes.slice(-winWeeks),
+    winDates = wk.dates.slice(-winWeeks);
+  const winHighs = wk.highs.slice(-winWeeks),
+    winLows = wk.lows.slice(-winWeeks);
+  const pivWin = pivots(winCloses, 2, winHighs, winLows);
+  const patterns = detectPatterns(winCloses, pivWin, avW * 3, cfg.digits);
   const scens = elliottScenarios(pivWin, cfg.digits);
 
   const rsiArr = rsi(closes),
@@ -8244,6 +8250,9 @@ function buildCMTModel(closes, volumes, dates, cfg, highs, lows) {
     up: closes[closes.length - 1] > closes[closes.length - 2],
   };
 
+  // buildPlaybook nhận `closes` đầy đủ khung ngày (để "last" = giá hiện tại
+  // thật) nhưng `piv` là pivot TUẦN — R/S/target/kịch bản A·B·C theo đó đều
+  // ở khung tuần, chỉ vị trí giá hiện tại được cập nhật theo từng phiên.
   const playbook = buildPlaybook({
     closes,
     piv: pivWin.map((p) => ({ ...p })),
@@ -8729,8 +8738,8 @@ export default function App() {
                 highs={model.winHighs}
                 lows={model.winLows}
                 digits={cfg.digits}
-                ma50={model.ma50.slice(-model.winCloses.length)}
-                ma200={model.ma200.slice(-model.winCloses.length)}
+                ma50={model.wk.ma50.slice(-model.winCloses.length)}
+                ma200={model.wk.ma200.slice(-model.winCloses.length)}
                 goLayer={setLayer}
                 analog={hist ? hist.analog : null}
               />
