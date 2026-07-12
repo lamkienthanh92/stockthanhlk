@@ -973,7 +973,7 @@ function analogAt(closes, states, asOf, horizon = 20) {
   return null;
 }
 
-function backtestSystem(closes, highs, lows) {
+function backtestSystem(closes, highs, lows, dates) {
   // Chỉ kiểm chứng phía MUA (long) — TTCK VN không có bán khống nên
   // kịch bản "breakout xuống" không sinh ra một lệnh nào để test.
   const H_ = highs || closes,
@@ -991,25 +991,33 @@ function backtestSystem(closes, highs, lows) {
     raw = { trades: [] };
   let inSys = null,
     inRaw = null;
-  const manage = (pos, book, c, i) => {
+  // Quét thắng/thua bằng High/Low thật trong phiên: đạt target nếu High
+  // chạm t1, bị vô hiệu nếu Low chạm mức inv — kể cả khi giá đóng cửa quay
+  // lại trong biên. Nếu cả hai cùng chạm trong 1 phiên, giả định thận trọng
+  // là bị vô hiệu (loss) trước.
+  const manage = (pos, book, i) => {
     if (!pos) return null;
-    const win = c >= pos.t1;
-    const loss = c < pos.inv;
+    const hi = H_[i],
+      lo = L_[i],
+      c = closes[i];
+    const win = hi >= pos.t1;
+    const loss = lo < pos.inv;
     if (win || loss || i - pos.i0 >= 30) {
-      const exitP = win ? pos.t1 : c;
+      const exitP = loss ? pos.inv : win ? pos.t1 : c;
       book.trades.push((exitP - pos.entry) / (pos.u || 1e-9));
       return null;
     }
     return pos;
   };
+  let firstIdx = null;
   for (let i = 210; i < closes.length; i++) {
     while (pi < piv.length && piv[pi].i + 4 <= i) {
       (piv[pi].type === "H" ? H : L).push(piv[pi]);
       pi++;
     }
     const c = closes[i];
-    inSys = manage(inSys, sys, c, i);
-    inRaw = manage(inRaw, raw, c, i);
+    inSys = manage(inSys, sys, i);
+    inRaw = manage(inRaw, raw, i);
     if (H.length < 2 || L.length < 2) continue;
     const winH = H_.slice(i - 40, i),
       winL = L_.slice(i - 40, i);
@@ -1018,6 +1026,7 @@ function backtestSystem(closes, highs, lows) {
     const range = R - S;
     if (range <= 0) continue;
     if (!(c > R && closes[i - 1] <= R)) continue; // chỉ xét breakout LÊN
+    if (firstIdx == null) firstIdx = i;
     const hh = H[H.length - 1].price > H[H.length - 2].price;
     const hl = L[L.length - 1].price > L[L.length - 2].price;
     const conds = [
@@ -1062,7 +1071,12 @@ function backtestSystem(closes, highs, lows) {
       eq,
     };
   };
-  return { sys: stat(sys), raw: stat(raw) };
+  // So sánh với "chỉ mua và giữ" trên đúng khoảng thời gian có thể đã giao
+  // dịch (từ lần breakout đầu tiên tới hết dữ liệu) — vì đây là cổ phiếu,
+  // luôn cần biết hệ thống có thắng nổi việc đơn giản là mua rồi để đó không.
+  const bhFrom = firstIdx != null ? firstIdx : 210;
+  const buyHold = dates ? buyHoldEquity(closes, dates, bhFrom) : null;
+  return { sys: stat(sys), raw: stat(raw), buyHold, buyHoldFromDate: dates ? dates[bhFrom] : null };
 }
 
 function percentileOf(sorted, v) {
@@ -1454,6 +1468,31 @@ function seriesStats(r) {
     hitRate: nz.length
       ? (nz.filter((v) => v > 0).length / nz.length) * 100
       : NaN,
+  };
+}
+// Benchmark "chỉ mua và giữ" (Buy & Hold) — vì đây là cổ phiếu (không phải
+// forex), mọi chiến lược cần so sánh với việc đơn giản là mua rồi nắm giữ từ
+// đầu kỳ OOS tới cuối. Trả về đường equity (%, giống format các view khác)
+// và daily returns để tính Sharpe/CAGR/MaxDD cùng thước đo với chiến lược.
+function buyHoldEquity(closes, dates, fromIdx) {
+  const n = closes.length;
+  const base = closes[fromIdx];
+  const equity = [];
+  const dailyReturns = Array(n).fill(0);
+  let cum = 0;
+  for (let i = fromIdx; i < n; i++) {
+    if (i > fromIdx) dailyReturns[i] = closes[i] / closes[i - 1] - 1;
+    cum = closes[i] / base - 1;
+    equity.push({ d: dates[i], cum: cum * 100 });
+  }
+  const st = seriesStats(dailyReturns.slice(fromIdx));
+  return {
+    equity,
+    dailyReturns,
+    totalReturnPct: cum * 100,
+    sharpe: st.sharpe,
+    maxDDPct: st.maxDD,
+    cagr: st.cagr,
   };
 }
 function rsStat(sub) {
@@ -2379,7 +2418,7 @@ function extractTradesRaw(fn, n, bh, closes) {
 const filterTradesByPhase = (trades, phase, label, upTo) =>
   trades.filter((t) => t.entryIdx < upTo && phase[t.entryIdx] === label);
 
-function buildConsensusTradesWithSL(pos, bh, closes, atr, slMult) {
+function buildConsensusTradesWithSL(pos, bh, closes, atr, slMult, lows, highs) {
   const n = pos.length,
     trades = [];
   let side = 0,
@@ -2427,7 +2466,17 @@ function buildConsensusTradesWithSL(pos, bh, closes, atr, slMult) {
     if (side !== 0) {
       cum *= 1 + side * bh[i];
       if (slPrice != null) {
-        const hit = side === 1 ? closes[i] <= slPrice : closes[i] >= slPrice;
+        // "Quét SL": dùng Low thật trong phiên (lệnh Long) — nếu giá chỉ
+        // chạm SL rồi đóng cửa hồi lại, lệnh dừng vẫn đã khớp trong thực tế.
+        // Chỉ dùng Close để kiểm tra khi chưa có dữ liệu Low/High thật.
+        const hit =
+          side === 1
+            ? lows
+              ? lows[i] <= slPrice
+              : closes[i] <= slPrice
+            : highs
+            ? highs[i] >= slPrice
+            : closes[i] >= slPrice;
         if (hit) {
           end(i, slPrice, true);
           side = 0;
@@ -2830,7 +2879,9 @@ function runPullbackWalkForward(
   closes,
   atr,
   opts,
-  direction
+  direction,
+  lows,
+  highs
 ) {
   const folds = Math.max(2, opts.wfFolds);
   const bnd = Array.from({ length: folds + 1 }, (_, k) =>
@@ -2884,7 +2935,9 @@ function runPullbackWalkForward(
     bh,
     closes,
     atr,
-    opts.slMult
+    opts.slMult,
+    lows,
+    highs
   );
   const oosTrades = allTrades.filter((t) => t.entryIdx >= oosStart);
   const sim = simulateEquityDaily(oosTrades, closes, n, opts.riskPct);
@@ -2963,7 +3016,9 @@ function runRangeFadeWalkForward(
   closes,
   atr,
   opts,
-  direction
+  direction,
+  lows,
+  highs
 ) {
   const folds = Math.max(2, opts.wfFolds);
   const bnd = Array.from({ length: folds + 1 }, (_, k) =>
@@ -3018,7 +3073,9 @@ function runRangeFadeWalkForward(
     bh,
     closes,
     atr,
-    opts.slMult
+    opts.slMult,
+    lows,
+    highs
   );
   const oosTrades = allTrades.filter((t) => t.entryIdx >= oosStart);
   const sim = simulateEquityDaily(oosTrades, closes, n, opts.riskPct);
@@ -3139,7 +3196,9 @@ function runProfitViewsWalkForward(
       bh,
       closes,
       atr,
-      opts.slMult
+      opts.slMult,
+      lows,
+      highs
     ).filter((t) => t.entryIdx >= oosStart);
     const sim = simulateEquityDaily(trades, closes, n, opts.riskPct);
     let cum = 0;
@@ -3172,6 +3231,7 @@ function runProfitViewsWalkForward(
     trendOnly: mk(trendOnly),
     rangeOnly: mk(rangeOnly),
     combined: mk(combined),
+    buyHold: buyHoldEquity(closes, dates, oosStart),
     pctTrendTime: cntTot ? (cntT / cntTot) * 100 : 0,
     pctRangeTime: cntTot ? (cntR / cntTot) * 100 : 0,
   };
@@ -3200,10 +3260,18 @@ function backtestStrategyCards(closes, dates, opts, digits, highs, lows) {
     }
     const last = closes[i];
     if (pos) {
-      const hitTP = last >= pos.tp;
-      const hitSL = last <= pos.stop;
+      // Quét TP/SL bằng High/Low thật trong phiên: TP coi như khớp nếu High
+      // chạm target, SL khớp nếu Low chạm mức dừng — kể cả khi giá đóng cửa
+      // quay lại trong biên (dùng Close-only sẽ bỏ sót các lần bị "quét SL"
+      // rồi hồi lại). Nếu cả TP và SL cùng bị chạm trong 1 phiên, giả định
+      // thận trọng là SL khớp trước.
+      const hi = H_[i],
+        lo = L_[i];
+      const hitTP = hi >= pos.tp;
+      const hitSL = lo <= pos.stop;
       if (hitTP || hitSL || i - pos.i0 >= maxHold) {
-        const exit = hitTP ? pos.tp : hitSL ? pos.stop : last;
+        const stoppedOut = hitSL;
+        const exit = stoppedOut ? pos.stop : hitTP ? pos.tp : last;
         const sl = Math.abs(pos.entry - pos.stop) || 1e-9;
         trades.push({
           entryIdx: pos.i0,
@@ -3217,7 +3285,7 @@ function backtestStrategyCards(closes, dates, opts, digits, highs, lows) {
           R: (exit - pos.entry) / sl,
           ret: (exit - pos.entry) / pos.entry,
           priceDiff: exit - pos.entry,
-          stoppedOut: hitSL,
+          stoppedOut,
           scen: pos.scen,
         });
         pos = null;
@@ -3328,6 +3396,7 @@ function backtestStrategyCards(closes, dates, opts, digits, highs, lows) {
     oosStart,
     oosFromDate: dates[oosStart],
     allCount: trades.length,
+    buyHold: buyHoldEquity(closes, dates, oosStart),
   };
 }
 
@@ -3483,7 +3552,9 @@ function runHurstAnalysis(closes, volumes, dates, opts, direction, digits, highs
     closes,
     atr,
     opts,
-    direction
+    direction,
+    lows,
+    highs
   );
   const trendPosLive = buildTrendConsensusSeries(
     liveGated.relTrend,
@@ -3504,7 +3575,9 @@ function runHurstAnalysis(closes, volumes, dates, opts, direction, digits, highs
     bh,
     closes,
     atr,
-    opts.slMult
+    opts.slMult,
+    lows,
+    highs
   );
   const pullbackEquitySimLive = simulateEquityDaily(
     pbTradesLive,
@@ -3538,7 +3611,9 @@ function runHurstAnalysis(closes, volumes, dates, opts, direction, digits, highs
     closes,
     atr,
     opts,
-    "long"
+    "long",
+    lows,
+    highs
   );
   const rangeConsLive = buildRangeConsensusSeries(
     liveGated.relRange,
@@ -3556,7 +3631,9 @@ function runHurstAnalysis(closes, volumes, dates, opts, direction, digits, highs
     bh,
     closes,
     atr,
-    opts.slMult
+    opts.slMult,
+    lows,
+    highs
   );
   const rangeFadeEquitySimLive = simulateEquityDaily(
     rfTradesLive,
@@ -3686,7 +3763,7 @@ function quickTrendConsensusFn(closes) {
     return c ? s / c : 0;
   };
 }
-function quickPullbackBacktest(closes, dir, atr, slMult, riskPct) {
+function quickPullbackBacktest(closes, dir, atr, slMult, riskPct, lows, highs) {
   const n = closes.length;
   const cons = quickTrendConsensusFn(closes);
   const trendPos = Array(n).fill(0);
@@ -3697,7 +3774,7 @@ function quickPullbackBacktest(closes, dir, atr, slMult, riskPct) {
   const bh = Array(n).fill(0);
   for (let i = 1; i < n; i++) bh[i] = closes[i] / closes[i - 1] - 1;
   const pos = buildPullbackPos(trendPos, closes, dir, atr, 0, 0);
-  const trades = buildConsensusTradesWithSL(pos, bh, closes, atr, slMult);
+  const trades = buildConsensusTradesWithSL(pos, bh, closes, atr, slMult, lows, highs);
   const sim = simulateEquityDaily(trades, closes, n, riskPct);
   const st = tradeStats(trades, n);
   return {
@@ -3795,7 +3872,7 @@ function screenStock(cfg, closes, volumes, dates, opts, highs, lows) {
   const volPct = ((atr[n - 1] ?? 0) / last) * 100;
   // Kiểm tra chất lượng "mua theo hồi xu hướng" trên chính mã này — luôn
   // theo chiều LONG vì TTCK VN không bán khống, bất kể bias hiện tại là gì.
-  const qb = quickPullbackBacktest(closes, "long", atr, opts.slMult, opts.riskPct);
+  const qb = quickPullbackBacktest(closes, "long", atr, opts.slMult, opts.riskPct, lows, highs);
 
   const prob = analog
     ? bias === "up"
@@ -6318,6 +6395,50 @@ function HistoryLayer({ cfg, hist, digits }) {
             </tr>
           </tbody>
         </table>
+        {system.buyHold && (
+          <div
+            className="scen"
+            style={{ borderColor: "rgba(233,180,76,.4)", marginBottom: 12 }}
+          >
+            <b>So với đối chứng bắt buộc cho cổ phiếu — chỉ MUA VÀ GIỮ</b>
+            <p className="sub" style={{ margin: "6px 0 10px" }}>
+              Nếu từ {system.buyHoldFromDate} (thời điểm breakout đầu tiên
+              trong dữ liệu) chỉ mua {cfg.label} rồi giữ tới nay, không giao
+              dịch gì thêm:
+            </p>
+            <div className="grid3">
+              <div className="kv" style={{ border: "none" }}>
+                <span>Tổng lợi nhuận</span>
+                <span
+                  className="num"
+                  style={{
+                    fontWeight: 700,
+                    color: system.buyHold.totalReturnPct >= 0 ? CLR.bull : CLR.bear,
+                  }}
+                >
+                  {system.buyHold.totalReturnPct >= 0 ? "+" : ""}
+                  {system.buyHold.totalReturnPct.toFixed(1)}%
+                </span>
+              </div>
+              <div className="kv" style={{ border: "none" }}>
+                <span>Sharpe (theo ngày)</span>
+                <span className="num">{system.buyHold.sharpe.toFixed(2)}</span>
+              </div>
+              <div className="kv" style={{ border: "none" }}>
+                <span>Max Drawdown</span>
+                <span className="num" style={{ color: CLR.bear }}>
+                  {system.buyHold.maxDDPct.toFixed(1)}%
+                </span>
+              </div>
+            </div>
+            <p className="sub" style={{ margin: "8px 0 0" }}>
+              Bảng phía trên tính bằng đơn vị vol-proxy (R-multiple) trên từng
+              lệnh riêng lẻ nên không cộng dồn trực tiếp thành % được — xem
+              phần "Lợi nhuận (3 góc nhìn)" ở tab Hurst để có đường % lợi
+              nhuận cộng dồn đối chiếu trực tiếp với đường Buy & Hold này.
+            </p>
+          </div>
+        )}
         {eqLen > 0 && (
           <>
             <div className="sub" style={{ marginBottom: 4 }}>
@@ -7340,14 +7461,30 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
             color: CLR.blue,
             note: `Chỉ tính trên đúng mã ${cfg.label}. Mỗi phiên xét regime CMT của mã này: breakout → trend pullback; trong biên → oscillator fade.`,
           },
+          buyhold: {
+            label: "Mua & Giữ (Buy & Hold)",
+            data: { equity: pv.buyHold.equity },
+            color: "#9aa5c0",
+            note: "Đối chứng bắt buộc cho cổ phiếu: mua từ đầu kỳ OOS rồi giữ nguyên, không giao dịch gì thêm. Mọi chiến lược ở trên phải thắng được đường này mới đáng cân nhắc.",
+            isBuyHold: true,
+          },
         };
         const cur = VIEWS[profitView];
-        const s = cur.data.sim,
-          ts = cur.data.tradeStats,
-          wl = cur.data.winLoss;
+        const s = cur.isBuyHold
+          ? {
+              totalReturnPct: pv.buyHold.totalReturnPct,
+              maxDDPct: pv.buyHold.maxDDPct,
+              blown: false,
+              finalMultiple: 1 + pv.buyHold.totalReturnPct / 100,
+            }
+          : cur.data.sim;
+        const ts = cur.isBuyHold
+          ? { sharpe: pv.buyHold.sharpe, count: null, hitRate: NaN, avgHoldDays: null }
+          : cur.data.tradeStats;
+        const wl = cur.isBuyHold ? null : cur.data.winLoss;
         const moneyEq = cur.data.equity.map((e) => ({ d: e.d, v: capital.value * (1 + e.cum / 100) }));
         const byDate = {};
-        ["trend", "range", "combined"].forEach((k) =>
+        ["trend", "range", "combined", "buyhold"].forEach((k) =>
           VIEWS[k].data.equity.forEach((p) => {
             (byDate[p.d] = byDate[p.d] || { d: p.d })[k] = p.cum;
           })
@@ -7359,8 +7496,8 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
         };
         return (
           <Panel
-            mod="Hurst · Lợi nhuận (3 góc nhìn)"
-            title={`${cfg.label} — chỉ Trend · chỉ Range · theo regime CMT`}
+            mod="Hurst · Lợi nhuận (4 góc nhìn)"
+            title={`${cfg.label} — chỉ Trend · chỉ Range · theo regime CMT · so với Mua & Giữ`}
             sub={`Rủi ro CỐ ĐỊNH ${riskPctIn.value}%/lệnh trên vốn gốc ${fmtMoney(
               capital.value
             )} (không dồn lãi). SL = ATR(${opts.atrPeriod})×${opts.slMult.toFixed(
@@ -7370,7 +7507,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
             )}% thời gian · range ${pv.pctRangeTime.toFixed(0)}%.`}
           >
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
-              {["trend", "range", "combined"].map((k) => (
+              {["trend", "range", "combined", "buyhold"].map((k) => (
                 <button
                   key={k}
                   className="bt"
@@ -7390,7 +7527,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
               ))}
             </div>
             <div className="sub" style={{ marginBottom: 4 }}>
-              So sánh cộng dồn OOS (%) — cả 3 góc nhìn
+              So sánh cộng dồn OOS (%) — cả 4 góc nhìn, kể cả Mua & Giữ
             </div>
             <div style={{ width: "100%", height: 190 }}>
               <ResponsiveContainer>
@@ -7416,9 +7553,10 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                     contentStyle={TT}
                     formatter={(v, nm) => [`${v.toFixed(1)}%`, VIEWS[nm] ? VIEWS[nm].label : nm]}
                   />
-                  <Line dataKey="trend" stroke={CLR.bull} dot={false} strokeWidth={profitView === "trend" ? 2.2 : 1} strokeOpacity={profitView === "trend" ? 1 : 0.45} isAnimationActive={false} connectNulls />
-                  <Line dataKey="range" stroke={CLR.amber} dot={false} strokeWidth={profitView === "range" ? 2.2 : 1} strokeOpacity={profitView === "range" ? 1 : 0.45} isAnimationActive={false} connectNulls />
-                  <Line dataKey="combined" stroke={CLR.blue} dot={false} strokeWidth={profitView === "combined" ? 2.2 : 1} strokeOpacity={profitView === "combined" ? 1 : 0.45} isAnimationActive={false} connectNulls />
+                  <Line dataKey="trend" stroke={CLR.bull} dot={false} strokeWidth={profitView === "trend" ? 2.2 : 1} strokeOpacity={profitView === "trend" ? 1 : 0.4} isAnimationActive={false} connectNulls />
+                  <Line dataKey="range" stroke={CLR.amber} dot={false} strokeWidth={profitView === "range" ? 2.2 : 1} strokeOpacity={profitView === "range" ? 1 : 0.4} isAnimationActive={false} connectNulls />
+                  <Line dataKey="combined" stroke={CLR.blue} dot={false} strokeWidth={profitView === "combined" ? 2.2 : 1} strokeOpacity={profitView === "combined" ? 1 : 0.4} isAnimationActive={false} connectNulls />
+                  <Line dataKey="buyhold" stroke="#9aa5c0" strokeDasharray="5 4" dot={false} strokeWidth={profitView === "buyhold" ? 2.2 : 1} strokeOpacity={profitView === "buyhold" ? 1 : 0.5} isAnimationActive={false} connectNulls />
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -7430,11 +7568,26 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                 color={s.totalReturnPct >= 0 ? CLR.bull : CLR.bear}
                 sub={s.blown ? "" : fmtMoney(capital.value * s.finalMultiple)}
               />
-              <MetricBox label="Sharpe (theo lệnh)" value={isFinite(ts.sharpe) ? ts.sharpe.toFixed(2) : "—"} sub={`${ts.count} lệnh · giữ TB ${ts.avgHoldDays ? ts.avgHoldDays.toFixed(1) : "—"} phiên`} />
-              <MetricBox label="Tỷ lệ thắng" value={isFinite(ts.hitRate) ? ts.hitRate.toFixed(0) + "%" : "—"} />
+              <MetricBox
+                label={cur.isBuyHold ? "Sharpe (theo ngày)" : "Sharpe (theo lệnh)"}
+                value={isFinite(ts.sharpe) ? ts.sharpe.toFixed(2) : "—"}
+                sub={cur.isBuyHold ? "nắm giữ toàn kỳ, không có lệnh rời rạc" : `${ts.count} lệnh · giữ TB ${ts.avgHoldDays ? ts.avgHoldDays.toFixed(1) : "—"} phiên`}
+              />
+              {!cur.isBuyHold && (
+                <MetricBox label="Tỷ lệ thắng" value={isFinite(ts.hitRate) ? ts.hitRate.toFixed(0) + "%" : "—"} />
+              )}
               <MetricBox label="Max Drawdown" value={`${s.maxDDPct.toFixed(1)}%`} color={CLR.bear} sub={fmtMoney((capital.value * Math.abs(s.maxDDPct)) / 100)} />
-              <MetricBox label="% lệnh dừng SL" value={isFinite(s.stoppedOutPct) ? s.stoppedOutPct.toFixed(0) + "%" : "—"} />
+              {!cur.isBuyHold && (
+                <MetricBox label="% lệnh dừng SL" value={isFinite(s.stoppedOutPct) ? s.stoppedOutPct.toFixed(0) + "%" : "—"} />
+              )}
             </div>
+            {cur.isBuyHold && (
+              <Warn>
+                Mua & Giữ không có lệnh dừng lỗ, không "quét SL" — đây là mốc
+                tối thiểu mọi chiến lược chủ động phải vượt qua (sau rủi ro và
+                công sức bỏ ra) mới đáng làm thay vì chỉ mua rồi để đó.
+              </Warn>
+            )}
             <div className="sub" style={{ marginBottom: 4 }}>
               Giá trị tài khoản — {cur.label} (vốn {fmtMoney(capital.value)})
             </div>
@@ -7449,43 +7602,45 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                 </LineChart>
               </ResponsiveContainer>
             </div>
-            <div style={{ overflowX: "auto", marginTop: 12 }}>
-              <table className="tbl" style={{ minWidth: 620 }}>
-                <thead>
-                  <tr>
-                    <th></th>
-                    <th>N</th>
-                    <th>Min</th>
-                    <th>Trung vị</th>
-                    <th>TB</th>
-                    <th>Max</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td style={{ color: CLR.bull, fontWeight: 800 }}>Lệnh THẮNG (đ/cp)</td>
-                    <td className="num">{wl.win ? wl.win.n : 0}</td>
-                    <td className="num" style={{ color: CLR.bull }}>{wl.win ? priceTxt(wl.win.min) : "—"}</td>
-                    <td className="num" style={{ color: CLR.bull }}>{wl.win ? priceTxt(wl.win.median) : "—"}</td>
-                    <td className="num" style={{ color: CLR.bull, fontWeight: 700 }}>{wl.win ? priceTxt(wl.win.mean) : "—"}</td>
-                    <td className="num" style={{ color: CLR.bull }}>{wl.win ? priceTxt(wl.win.max) : "—"}</td>
-                  </tr>
-                  <tr>
-                    <td style={{ color: CLR.bear, fontWeight: 800 }}>Lệnh THUA (đ/cp)</td>
-                    <td className="num">{wl.loss ? wl.loss.n : 0}</td>
-                    <td className="num" style={{ color: CLR.bear }}>{wl.loss ? priceTxt(wl.loss.min) : "—"}</td>
-                    <td className="num" style={{ color: CLR.bear }}>{wl.loss ? priceTxt(wl.loss.median) : "—"}</td>
-                    <td className="num" style={{ color: CLR.bear, fontWeight: 700 }}>{wl.loss ? priceTxt(wl.loss.mean) : "—"}</td>
-                    <td className="num" style={{ color: CLR.bear }}>{wl.loss ? priceTxt(wl.loss.max) : "—"}</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
+            {!cur.isBuyHold && wl && (
+              <div style={{ overflowX: "auto", marginTop: 12 }}>
+                <table className="tbl" style={{ minWidth: 620 }}>
+                  <thead>
+                    <tr>
+                      <th></th>
+                      <th>N</th>
+                      <th>Min</th>
+                      <th>Trung vị</th>
+                      <th>TB</th>
+                      <th>Max</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td style={{ color: CLR.bull, fontWeight: 800 }}>Lệnh THẮNG (đ/cp)</td>
+                      <td className="num">{wl.win ? wl.win.n : 0}</td>
+                      <td className="num" style={{ color: CLR.bull }}>{wl.win ? priceTxt(wl.win.min) : "—"}</td>
+                      <td className="num" style={{ color: CLR.bull }}>{wl.win ? priceTxt(wl.win.median) : "—"}</td>
+                      <td className="num" style={{ color: CLR.bull, fontWeight: 700 }}>{wl.win ? priceTxt(wl.win.mean) : "—"}</td>
+                      <td className="num" style={{ color: CLR.bull }}>{wl.win ? priceTxt(wl.win.max) : "—"}</td>
+                    </tr>
+                    <tr>
+                      <td style={{ color: CLR.bear, fontWeight: 800 }}>Lệnh THUA (đ/cp)</td>
+                      <td className="num">{wl.loss ? wl.loss.n : 0}</td>
+                      <td className="num" style={{ color: CLR.bear }}>{wl.loss ? priceTxt(wl.loss.min) : "—"}</td>
+                      <td className="num" style={{ color: CLR.bear }}>{wl.loss ? priceTxt(wl.loss.median) : "—"}</td>
+                      <td className="num" style={{ color: CLR.bear, fontWeight: 700 }}>{wl.loss ? priceTxt(wl.loss.mean) : "—"}</td>
+                      <td className="num" style={{ color: CLR.bear }}>{wl.loss ? priceTxt(wl.loss.max) : "—"}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )}
             <p className="sub" style={{ marginTop: 10, fontSize: 11 }}>
-              ⚠ Walk-forward ngoài mẫu, khớp tại giá đóng cửa, chưa trừ
-              phí/thuế/trượt giá. Rủi ro cố định trên vốn gốc (không dồn lãi)
-              nên đây là % cộng dồn tuyến tính, không phải tăng trưởng kép của
-              tài khoản thật.
+              ⚠ Walk-forward ngoài mẫu, quét TP/SL bằng High/Low thật trong
+              phiên (không chỉ giá đóng cửa), chưa trừ phí/thuế/trượt giá. Rủi
+              ro cố định trên vốn gốc (không dồn lãi) nên đây là % cộng dồn
+              tuyến tính, không phải tăng trưởng kép của tài khoản thật.
             </p>
           </Panel>
         );
@@ -7497,7 +7652,6 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
         const s = cb.sim,
           ts = cb.tradeStats,
           wl = cb.winLoss;
-        const moneyEq = cb.equity.map((e) => ({ d: e.d, v: capital.value * (1 + e.cum / 100) }));
         const scenName = {
           "reject-S": "Mua tại hỗ trợ (fade)",
           A: "Mua theo tiếp diễn phá lên",
@@ -7530,18 +7684,42 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                   <MetricBox label="Tỷ lệ thắng" value={isFinite(ts.hitRate) ? ts.hitRate.toFixed(0) + "%" : "—"} />
                   <MetricBox label="Sharpe (theo lệnh)" value={isFinite(ts.sharpe) ? ts.sharpe.toFixed(2) : "—"} />
                   <MetricBox label="Max Drawdown" value={`${s.maxDDPct.toFixed(1)}%`} color={CLR.bear} />
+                  <MetricBox
+                    label="So với Mua & Giữ"
+                    value={`${s.totalReturnPct - cb.buyHold.totalReturnPct >= 0 ? "+" : ""}${(
+                      s.totalReturnPct - cb.buyHold.totalReturnPct
+                    ).toFixed(1)}%`}
+                    color={s.totalReturnPct >= cb.buyHold.totalReturnPct ? CLR.bull : CLR.bear}
+                    sub={`Mua & Giữ cùng kỳ: ${cb.buyHold.totalReturnPct >= 0 ? "+" : ""}${cb.buyHold.totalReturnPct.toFixed(1)}%`}
+                  />
                 </div>
                 <div className="sub" style={{ marginBottom: 4 }}>
-                  Đường vốn (OOS, walk-forward causal)
+                  Đường vốn (OOS, walk-forward causal) — nét liền là chiến
+                  lược, nét đứt là chỉ mua & giữ
                 </div>
                 <div style={{ width: "100%", height: 150 }}>
                   <ResponsiveContainer>
-                    <LineChart data={moneyEq} margin={{ top: 4, right: 6, bottom: 0, left: 0 }}>
-                      <Line dataKey="v" stroke={CLR.blue} dot={false} strokeWidth={1.8} isAnimationActive={false} />
+                    <LineChart
+                      data={(() => {
+                        const byD = {};
+                        cb.equity.forEach((e) => {
+                          (byD[e.d] = byD[e.d] || { d: e.d }).strat =
+                            capital.value * (1 + e.cum / 100);
+                        });
+                        cb.buyHold.equity.forEach((e) => {
+                          (byD[e.d] = byD[e.d] || { d: e.d }).bh =
+                            capital.value * (1 + e.cum / 100);
+                        });
+                        return Object.values(byD);
+                      })()}
+                      margin={{ top: 4, right: 6, bottom: 0, left: 0 }}
+                    >
+                      <Line dataKey="strat" name="Chiến lược" stroke={CLR.blue} dot={false} strokeWidth={1.8} isAnimationActive={false} connectNulls />
+                      <Line dataKey="bh" name="Mua & Giữ" stroke="#9aa5c0" strokeDasharray="5 4" dot={false} strokeWidth={1.4} isAnimationActive={false} connectNulls />
                       <XAxis dataKey="d" hide />
                       <YAxis hide domain={["auto", "auto"]} />
                       <ReferenceLine y={capital.value} stroke={CLR.line} label={{ value: "vốn gốc", fill: CLR.mut, fontSize: 10, position: "insideBottomLeft" }} />
-                      <Tooltip contentStyle={TT} formatter={(v) => [fmtMoney(v), "Giá trị tài khoản"]} labelStyle={{ color: CLR.blue }} />
+                      <Tooltip contentStyle={TT} formatter={(v, nm) => [fmtMoney(v), nm === "strat" ? "Chiến lược" : "Mua & Giữ"]} labelStyle={{ color: CLR.blue }} />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
@@ -7910,7 +8088,7 @@ export default function App() {
       rule: scanBreakoutRule(closes, highs, lows),
       confl: backtestConfluenceRolling(closes, highs, lows),
       analog: analogProbabilities(closes, states),
-      system: backtestSystem(closes, highs, lows),
+      system: backtestSystem(closes, highs, lows, dates),
       swings: scanSwings(closes, dates, highs, lows),
     };
   }, [stockData]);
