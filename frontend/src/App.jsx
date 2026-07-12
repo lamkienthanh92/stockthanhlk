@@ -29,6 +29,7 @@ import {
   ComposedChart,
   Bar,
   Line,
+  Area,
   XAxis,
   YAxis,
   Tooltip,
@@ -3332,7 +3333,8 @@ function buildWeeklyCMT(closes, highs, lows, dates) {
 //  (3) Xuống khung NGÀY để bắt điểm vào: đồng thuận bộ chỉ báo đang NGHIÊNG
 //      MUA (> ngưỡng) VÀ giá phiên quyết định vừa giảm so với phiên trước
 //      (mua theo nhịp giảm trong hướng/biên đã xác định ở (1)+(2)).
-//      SL = entry − ATR(period)×slMult (khung ngày, bắt điểm chính xác).
+//      SL = entry × (1 − stopPct) — cắt lỗ % cố định (mặc định 10%), không
+//      dùng khung ATR kiểu tài khoản margin vì mua cổ phiếu VN bằng tiền mặt.
 //      Thoát khi High chạm TP tuần, Low chạm SL (quét thật trong phiên),
 //      hết thời gian giữ tối đa, hoặc hỗ trợ TUẦN bị phá khi đang giữ
 //      (bảo vệ vốn — kịch bản tuần đã đổi).
@@ -3343,10 +3345,6 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   const n = closes.length;
   const H_ = highs || closes,
     L_ = lows || closes;
-  const atr =
-    highs && lows
-      ? atrTrue(highs, lows, closes, opts.atrPeriod)
-      : closeATR(closes, opts.atrPeriod);
 
   // (1) CMT khung TUẦN — hướng, R/S, target cho toàn bộ lịch sử một lần
   const wCMT = buildWeeklyCMT(closes, highs, lows, dates);
@@ -3443,10 +3441,13 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     // (3) Xuống khung ngày bắt điểm vào: đồng thuận mua + giá vừa giảm
     const pulledBack = j >= 1 && closes[j] < closes[j - 1];
     if (consensus > ENTRY_CONSENSUS_THR && pulledBack) {
-      const a = atr[j];
-      if (a == null || a <= 0) continue;
-      const slDist = a * opts.slMult;
+      // TTCK VN mua bằng tiền mặt, không cần khung "R theo ATR" kiểu tài
+      // khoản margin — cắt lỗ đơn giản bằng % cố định trên giá vào (mặc
+      // định 10%). "R" trong kết quả vẫn giữ lại làm đơn vị rủi ro chuẩn
+      // hoá (R=1 nghĩa là lỗ đúng 10%), chỉ đổi cách đo khoảng cách SL.
+      const stopPct = opts.stopPct || 0.1;
       const entry = lastC;
+      const slDist = entry * stopPct;
       const stop = entry - slDist;
       if (stop >= entry) continue;
       pos = { i0: i, entry, stop, tp: target, slDist, state, phase: ph };
@@ -4496,12 +4497,19 @@ function VolumeMiniChart({ dates, volumes, closes, height = 60 }) {
 function PriceChart({
   dates,
   closes,
+  highs,
+  lows,
   digits,
   height = 300,
   dots = null,
   refLines = null,
 }) {
-  const data = closes.map((c, i) => ({ i, d: dates[i], c }));
+  const data = closes.map((c, i) => ({
+    i,
+    d: dates[i],
+    c,
+    range: highs && lows ? [lows[i], highs[i]] : undefined,
+  }));
   const fmt = (v) => Number(v).toLocaleString("vi-VN", { maximumFractionDigits: digits });
   return (
     <ResponsiveContainer width="100%" height={height}>
@@ -4534,8 +4542,21 @@ function PriceChart({
         <Tooltip
           contentStyle={TT}
           labelStyle={{ color: CLR.mut }}
-          formatter={(v) => [fmt(v), "Giá"]}
+          formatter={(v, name) =>
+            name === "range"
+              ? [`${fmt(v[0])} – ${fmt(v[1])}`, "Low–High"]
+              : [fmt(v), "Đóng cửa"]
+          }
         />
+        {highs && lows && (
+          <Area
+            dataKey="range"
+            stroke="none"
+            fill={CLR.mut}
+            fillOpacity={0.12}
+            isAnimationActive={false}
+          />
+        )}
         <Line
           dataKey="c"
           stroke={CLR.blue}
@@ -5081,7 +5102,7 @@ function LiveDeskPanel({ rows, openStock }) {
       title={`Đang giữ ${holding.length} mã${
         openedToday.length ? ` · mở mới hôm nay ${openedToday.length}` : ""
       }${closedToday.length ? ` · đóng hôm nay ${closedToday.length}` : ""}`}
-      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG TUẦN (dùng tuần trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. SL = ATR ngày×hệ số. Chỉ Long."
+      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG TUẦN (dùng tuần trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. Cắt lỗ % cố định trên giá vào (không dùng ATR kiểu margin). Chỉ Long."
     >
       {holding.length === 0 ? (
         <p className="sub">
@@ -5535,7 +5556,7 @@ function ScreenerSection({ rows, openStock }) {
    8. CMT — LỚP 1: XU HƯỚNG
    ============================================================ */
 
-function TrendLayer({ cfg, tf, setTf, frames, dates, closes, volumes, digits, piv, cascade }) {
+function TrendLayer({ cfg, tf, setTf, frames, dates, closes, highs, lows, volumes, digits, piv, cascade }) {
   const n = Math.min(closes.length, tf === "M" ? 60 : tf === "W" ? 80 : 160);
   const off = closes.length - n;
   const dots = piv
@@ -5696,7 +5717,7 @@ function TrendLayer({ cfg, tf, setTf, frames, dates, closes, volumes, digits, pi
         title={`${cfg.label} — khung ${
           tf === "M" ? "Tháng" : tf === "W" ? "Tuần" : "Ngày"
         }`}
-        sub="Đ = đỉnh swing, đ = đáy swing dùng cho chuỗi Dow."
+        sub="Đ = đỉnh swing, đ = đáy swing dùng cho chuỗi Dow — lấy từ High/Low thật trong phiên/tuần/tháng, nên có thể nằm ngoài đường giá đóng cửa; dải mờ phía sau là vùng High–Low để đối chiếu."
       >
         <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
           {["M", "W", "D"].map((k) => (
@@ -5713,6 +5734,8 @@ function TrendLayer({ cfg, tf, setTf, frames, dates, closes, volumes, digits, pi
         <PriceChart
           dates={dates.slice(-n)}
           closes={closes.slice(-n)}
+          highs={highs ? highs.slice(-n) : undefined}
+          lows={lows ? lows.slice(-n) : undefined}
           digits={digits}
           dots={dots}
         />
@@ -5725,7 +5748,7 @@ function TrendLayer({ cfg, tf, setTf, frames, dates, closes, volumes, digits, pi
    9. CMT — LỚP 2: CẤU TRÚC GIÁ
    ============================================================ */
 
-function StructureLayer({ dates, closes, digits, patterns, scens, swings }) {
+function StructureLayer({ dates, closes, highs, lows, digits, patterns, scens, swings }) {
   const [scIdx, setScIdx] = useState(0);
   const sc = scens[Math.min(scIdx, scens.length - 1)];
   const dots = sc
@@ -5834,7 +5857,7 @@ function StructureLayer({ dates, closes, digits, patterns, scens, swings }) {
       <Panel
         mod="Module 2 · Chart Patterns"
         title="Mẫu hình cổ điển đang theo dõi"
-        sub="Nhận diện từ pivot trên giá đóng cửa thật; target đo bằng chiều cao mẫu hình."
+        sub="Nhận diện từ đỉnh/đáy High/Low thật; target đo bằng chiều cao mẫu hình."
       >
         {patterns.length === 0 && (
           <p className="sub">
@@ -5878,6 +5901,8 @@ function StructureLayer({ dates, closes, digits, patterns, scens, swings }) {
         <PriceChart
           dates={dates}
           closes={closes}
+          highs={highs}
+          lows={lows}
           digits={digits}
           dots={dots}
           refLines={refs}
@@ -6315,7 +6340,7 @@ function RiskLayer({ allCloses, matrixKeys, vol, volIsTrueATR, cfg, digits, last
    12. CMT — LỚP 5: KỊCH BẢN GIAO DỊCH
    ============================================================ */
 
-function PlaybookChart({ dates, closes, digits, pb, ma50, ma200 }) {
+function PlaybookChart({ dates, closes, highs, lows, digits, pb, ma50, ma200 }) {
   const n = Math.min(130, closes.length),
     off = closes.length - n;
   const data = closes
@@ -6325,11 +6350,14 @@ function PlaybookChart({ dates, closes, digits, pb, ma50, ma200 }) {
       c,
       m50: ma50[off + i],
       m200: ma200[off + i],
+      range: highs && lows ? [lows[off + i], highs[off + i]] : undefined,
     }));
   const fmt = (v) => Number(v).toLocaleString("vi-VN", { maximumFractionDigits: digits });
   const yPad = pb.range * 0.15;
-  const yMin = Math.min(pb.tB2, Math.min(...closes.slice(-n))) - yPad;
-  const yMax = Math.max(pb.tA2, Math.max(...closes.slice(-n))) + yPad;
+  const loSlice = lows ? lows.slice(-n) : closes.slice(-n);
+  const hiSlice = highs ? highs.slice(-n) : closes.slice(-n);
+  const yMin = Math.min(pb.tB2, Math.min(...loSlice)) - yPad;
+  const yMax = Math.max(pb.tA2, Math.max(...hiSlice)) + yPad;
   const rl = (y, c, l, pos, dash) => (
     <ReferenceLine
       y={y}
@@ -6378,6 +6406,9 @@ function PlaybookChart({ dates, closes, digits, pb, ma50, ma200 }) {
         />
         <ReferenceArea y1={pb.R} y2={yMax} fill={CLR.bull} fillOpacity={0.05} />
         <ReferenceArea y1={yMin} y2={pb.S} fill={CLR.bear} fillOpacity={0.05} />
+        {highs && lows && (
+          <Area dataKey="range" stroke="none" fill={CLR.mut} fillOpacity={0.12} isAnimationActive={false} />
+        )}
         {pb.fibs.map((f) => (
           <ReferenceLine
             key={f.f}
@@ -6442,7 +6473,7 @@ const LAYER_NAMES = {
   3: "L3 Xác nhận",
 };
 
-function PlaybookLayer({ cfg, pb, dates, closes, digits, ma50, ma200, goLayer, analog }) {
+function PlaybookLayer({ cfg, pb, dates, closes, highs, lows, digits, ma50, ma200, goLayer, analog }) {
   const probOf = (id) =>
     analog
       ? id === "A"
@@ -6502,6 +6533,8 @@ function PlaybookLayer({ cfg, pb, dates, closes, digits, ma50, ma200, goLayer, a
         <PlaybookChart
           dates={dates}
           closes={closes}
+          highs={highs}
+          lows={lows}
           digits={digits}
           pb={pb}
           ma50={ma50}
@@ -7665,7 +7698,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
             />
           </div>
           <div>
-            <label className="lb">Hệ số SL (×ATR)</label>
+            <label className="lb">Hệ số SL (×ATR) — luật Trend/Range</label>
             <input
               className="inp"
               style={{ width: 80 }}
@@ -7675,6 +7708,21 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
               max="6"
               value={opts.slMult}
               onChange={(e) => setOpt("slMult", Math.max(0.5, Math.min(6, +e.target.value || 2)))}
+            />
+          </div>
+          <div>
+            <label className="lb">Cắt lỗ (%) — luật CMT×Hurst tuần</label>
+            <input
+              className="inp"
+              style={{ width: 80 }}
+              type="number"
+              step="1"
+              min="2"
+              max="30"
+              value={Math.round(opts.stopPct * 100)}
+              onChange={(e) =>
+                setOpt("stopPct", Math.max(2, Math.min(30, +e.target.value || 10)) / 100)
+              }
             />
           </div>
           <div>
@@ -7946,9 +7994,9 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
           <Panel
             mod="Hurst · Backtest theo luật CMT × Hurst"
             title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
-            sub={`Luật: (1) CMT xác định hướng + TP trên KHUNG TUẦN (tuần trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. SL = ATR ngày×${opts.slMult.toFixed(
-              1
-            )}. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
+            sub={`Luật: (1) CMT xác định hướng + TP trên KHUNG TUẦN (tuần trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. Cắt lỗ ${Math.round(
+              opts.stopPct * 100
+            )}% trên giá vào (không dùng ATR kiểu margin). Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
           >
             <div
               style={{
@@ -8151,6 +8199,10 @@ function buildCMTModel(closes, volumes, dates, cfg, highs, lows) {
   const mo = aggMonthly(closes, dates);
   const wkHL = aggWeeklyHL(H_, L_, dates);
   const moHL = aggMonthlyHL(H_, L_, dates);
+  wk.highs = wkHL.highs;
+  wk.lows = wkHL.lows;
+  mo.highs = moHL.highs;
+  mo.lows = moHL.lows;
   const pivD = pivots(closes, 4, highs, lows);
   const pivW = pivots(wk.closes, 2, wkHL.highs, wkHL.lows);
   const pivM = pivots(mo.closes, 2, moHL.highs, moHL.lows);
@@ -8311,6 +8363,8 @@ function buildCMTModel(closes, volumes, dates, cfg, highs, lows) {
     tradeGate,
     winCloses,
     winDates,
+    winHighs,
+    winLows,
     verdicts,
     vol: highs && lows ? (atrTrue(highs, lows, closes, 14).slice(-1)[0] ?? av) : av,
     volIsTrueATR: !!(highs && lows),
@@ -8345,6 +8399,7 @@ export default function App() {
     hurstFilterMode: "gated",
     atrPeriod: 14,
     slMult: 2,
+    stopPct: 0.1,
     minTrendStrength: 0,
     minPullbackATR: 0,
     rangeEnterThr: 0.2,
@@ -8386,12 +8441,13 @@ export default function App() {
     () => ({
       atrPeriod: opts.atrPeriod,
       slMult: opts.slMult,
+      stopPct: opts.stopPct,
       riskPct: Math.max(0.1, riskPctIn) / 100,
       hurstWin: opts.hurstWin,
       hurstStep: opts.hurstStep,
       cardMaxHold: opts.cardMaxHold,
     }),
-    [opts.atrPeriod, opts.slMult, riskPctIn, opts.hurstWin, opts.hurstStep, opts.cardMaxHold]
+    [opts.atrPeriod, opts.slMult, opts.stopPct, riskPctIn, opts.hurstWin, opts.hurstStep, opts.cardMaxHold]
   );
 
   const screener = useMemo(() => {
@@ -8509,6 +8565,8 @@ export default function App() {
   const pbBiasPct = model.playbook.biasPct;
   const tfCloses = tf === "M" ? model.mo.closes : tf === "W" ? model.wk.closes : stockData.closes;
   const tfDates = tf === "M" ? model.mo.dates : tf === "W" ? model.wk.dates : stockData.dates;
+  const tfHighs = tf === "M" ? model.mo.highs : tf === "W" ? model.wk.highs : stockData.highs;
+  const tfLows = tf === "M" ? model.mo.lows : tf === "W" ? model.wk.lows : stockData.lows;
   const tfPiv = tf === "M" ? model.pivM : tf === "W" ? model.pivW : model.pivD;
 
   const STEPS = [
@@ -8617,6 +8675,8 @@ export default function App() {
                 frames={model.frames}
                 dates={tfDates}
                 closes={tfCloses}
+                highs={tfHighs}
+                lows={tfLows}
                 volumes={stockData.volumes}
                 digits={cfg.digits}
                 piv={tfPiv}
@@ -8629,6 +8689,8 @@ export default function App() {
                 swings={hist ? hist.swings : null}
                 dates={model.winDates}
                 closes={model.winCloses}
+                highs={model.winHighs}
+                lows={model.winLows}
                 digits={cfg.digits}
                 patterns={model.patterns}
                 scens={model.scens}
@@ -8664,6 +8726,8 @@ export default function App() {
                 pb={model.playbook}
                 dates={model.winDates}
                 closes={model.winCloses}
+                highs={model.winHighs}
+                lows={model.winLows}
                 digits={cfg.digits}
                 ma50={model.ma50.slice(-model.winCloses.length)}
                 ma200={model.ma200.slice(-model.winCloses.length)}
