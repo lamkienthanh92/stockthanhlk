@@ -3237,42 +3237,84 @@ function runProfitViewsWalkForward(
   };
 }
 
-function backtestStrategyCards(closes, dates, opts, digits, highs, lows) {
-  // Chỉ mua (long) — TTCK VN không bán khống, nên thẻ chiến lược không bao
-  // giờ sinh lệnh short; "side" giữ lại trong dữ liệu trade chỉ để tương
-  // thích với các hàm tính R/priceDiff dùng chung, luôn = 1 (long).
+// ============================================================
+// LUẬT GIAO DỊCH CMT × HURST — dùng chung cho backtest lịch sử VÀ
+// trạng thái "đang sống" hiển thị trên Bộ lọc. Hoàn toàn nhân quả
+// (không nhìn trước), chỉ Long (TTCK VN không bán khống):
+//
+//  (1) CMT xác định HƯỚNG + TP: R/S lấy từ pivot đỉnh/đáy thật gần nhất
+//      (rơi về cao/thấp 40 phiên nếu chưa có pivot phù hợp).
+//        · Đã breakout lên (giá đóng cửa > R): TP = R + 0.618×(R−S)
+//        · Đang trong biên: TP = R (kháng cự)
+//        · Breakout xuống (giá đóng cửa < S): KHÔNG vào lệnh
+//  (2) Hurst xác định regime Trend/Range của NGÀY quyết định → chọn đúng
+//      bộ chỉ báo tương ứng (22 Trend kể cả Volume, hoặc 20 Range) để
+//      lấy tín hiệu đồng thuận (net trung bình dấu, không lọc walk-forward
+//      để tính được nhanh cho cả 30 mã).
+//  (3) Vào lệnh khi đồng thuận bộ chỉ báo đang NGHIÊNG MUA (> ngưỡng) VÀ
+//      giá phiên quyết định vừa giảm so với phiên trước đó (mua theo nhịp
+//      giảm trong xu hướng/biên đã xác định ở (1)+(2)).
+//      SL = entry − ATR(period)×slMult. Thoát khi High chạm TP, Low chạm
+//      SL (quét thật trong phiên), hết thời gian giữ tối đa, hoặc CMT tự
+//      chuyển sang cảnh báo giảm khi đang giữ (bảo vệ vốn).
+// ============================================================
+const ENTRY_CONSENSUS_THR = 0.2;
+
+function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
+  const n = closes.length;
   const H_ = highs || closes,
     L_ = lows || closes;
-  const n = closes.length;
-  const states = buildStates(closes, highs, lows);
+  const atr =
+    highs && lows
+      ? atrTrue(highs, lows, closes, opts.atrPeriod)
+      : closeATR(closes, opts.atrPeriod);
+
+  // (2) Hurst phase — phân loại nhanh (buffer/stableWin cố định, không dò
+  // walk-forward) để tính được cho cả rổ 30 mã mà không quá nặng.
+  const rets = Array(n).fill(0);
+  for (let i = 1; i < n; i++) rets[i] = Math.log(closes[i] / closes[i - 1]);
+  const hurstDense = denseHurst(
+    rollingHurst(rets.slice(1), opts.hurstWin, opts.hurstStep),
+    n
+  );
+  const phase = classifyPhase(hurstDense, n, 5, 0.03);
+
+  // (2) Đúng bộ 22 chỉ báo Trend (kể cả Volume) / 20 chỉ báo Range dùng ở tab Hurst
+  const { trendDefs, rangeDefs } = buildDefs(closes, volumes, highs, lows);
+  const netAt = (defs, i) => {
+    let s = 0,
+      c = 0;
+    for (let k = 0; k < defs.length; k++) {
+      const v = defs[k][2](i);
+      s += v > 0 ? 1 : v < 0 ? -1 : 0;
+      c++;
+    }
+    return c ? s / c : 0;
+  };
+
   const piv = pivots(closes, 4, highs, lows);
-  const trades = [];
-  let pos = null,
-    pi = 0;
+  let pi = 0;
   const H = [],
     L = [];
-  const warmup = 300,
-    maxHold = opts.cardMaxHold || 30;
-  for (let i = warmup; i < n; i++) {
-    while (pi < piv.length && piv[pi].i + 4 <= i) {
-      (piv[pi].type === "H" ? H : L).push(piv[pi]);
-      pi++;
-    }
-    const last = closes[i];
+  const trades = [];
+  let pos = null;
+  const maxHold = opts.cardMaxHold || 30;
+  const start = Math.max(300, opts.hurstWin + 10);
+
+  for (let i = start; i < n; i++) {
+    // (a) Quản lý vị thế đang mở — quét TP/SL bằng High/Low THẬT của phiên i
+    let justExited = false;
     if (pos) {
-      // Quét TP/SL bằng High/Low thật trong phiên: TP coi như khớp nếu High
-      // chạm target, SL khớp nếu Low chạm mức dừng — kể cả khi giá đóng cửa
-      // quay lại trong biên (dùng Close-only sẽ bỏ sót các lần bị "quét SL"
-      // rồi hồi lại). Nếu cả TP và SL cùng bị chạm trong 1 phiên, giả định
-      // thận trọng là SL khớp trước.
       const hi = H_[i],
-        lo = L_[i];
+        lo = L_[i],
+        c = closes[i];
       const hitTP = hi >= pos.tp;
       const hitSL = lo <= pos.stop;
-      if (hitTP || hitSL || i - pos.i0 >= maxHold) {
-        const stoppedOut = hitSL;
-        const exit = stoppedOut ? pos.stop : hitTP ? pos.tp : last;
-        const sl = Math.abs(pos.entry - pos.stop) || 1e-9;
+      const S40now = Math.min(...L_.slice(Math.max(0, i - 40), i));
+      const flipDown = c < S40now; // bảo vệ vốn: CMT đã cảnh báo breakdown
+      if (hitTP || hitSL || flipDown || i - pos.i0 >= maxHold) {
+        const stoppedOut = hitSL || flipDown;
+        const exit = hitSL ? pos.stop : hitTP ? pos.tp : flipDown ? c : c;
         trades.push({
           entryIdx: pos.i0,
           exitIdx: i,
@@ -3281,95 +3323,130 @@ function backtestStrategyCards(closes, dates, opts, digits, highs, lows) {
           entryPrice: pos.entry,
           exitPrice: exit,
           finalExitPrice: exit,
-          slDistance: sl,
-          R: (exit - pos.entry) / sl,
+          slDistance: pos.slDist,
+          R: (exit - pos.entry) / pos.slDist,
           ret: (exit - pos.entry) / pos.entry,
           priceDiff: exit - pos.entry,
           stoppedOut,
-          scen: pos.scen,
+          exitReason: hitTP ? "tp" : hitSL ? "sl" : flipDown ? "flip" : "timeout",
+          scen: pos.state,
         });
         pos = null;
+        justExited = true;
       }
     }
-    if (pos || i >= n - 2) continue;
-    const overhead = H.filter((p) => p.price > last).map((p) => p.price);
-    const below = L.filter((p) => p.price < last).map((p) => p.price);
-    const w40H = H_.slice(i - 40, i),
-      w40L = L_.slice(i - 40, i);
+    if (pos || justExited) continue;
+
+    // (b) Xác nhận pivot tới ngày quyết định j = i-1 (chỉ dùng dữ liệu đã biết)
+    const j = i - 1;
+    while (pi < piv.length && piv[pi].i + 4 <= j) {
+      (piv[pi].type === "H" ? H : L).push(piv[pi]);
+      pi++;
+    }
+    const lastC = closes[j];
+    const overhead = H.filter((p) => p.price > lastC).map((p) => p.price);
+    const below = L.filter((p) => p.price < lastC).map((p) => p.price);
+    const w40H = H_.slice(Math.max(0, j - 40), j),
+      w40L = L_.slice(Math.max(0, j - 40), j);
+    if (!w40H.length) continue;
     const R = overhead.length ? Math.min(...overhead) : Math.max(...w40H);
     const S = below.length ? Math.max(...below) : Math.min(...w40L);
     const range = Math.max(R - S, 1e-9);
-    const posInRange = (last - S) / range;
-    const R40 = Math.max(...w40H),
-      S40 = Math.min(...w40L);
-    const broke = last > R40 || last < S40;
-    if (!broke && posInRange < 0.7 && posInRange > 0.3) continue;
-    const analog = analogAt(closes, states, i, 20);
-    if (!analog) continue;
-    let state =
-      last > R40
-        ? "RUN_UP"
-        : last < S40
-        ? "RUN_DOWN"
-        : Math.min(R - last, last - S) / range < 0.15
-        ? "NEAR_TRIGGER"
-        : "IN_RANGE";
-    const st = deriveStrategy({
-      digits,
-      price: last,
-      R,
-      S,
-      range,
-      state,
-      analog,
-      tM: "side",
-      tW: "side",
-      tD: "side",
-      bias: "side",
-      biasPct: 50,
-    });
-    // Chỉ mở lệnh khi deriveStrategy cho ra một khuyến nghị MUA hành động
-    // ngay (side "long"); mọi kịch bản giảm/tránh mua đều bị bỏ qua ở đây.
-    if (
-      st.actionable &&
-      st.side === "long" &&
-      st.entryTrigger === "now" &&
-      st.stopY != null &&
-      st.tp1Y != null &&
-      st.stopY < last &&
-      st.tp1Y > last
-    ) {
-      pos = {
-        i0: i,
-        entry: last,
-        stop: st.stopY,
-        tp: st.tp1Y,
-        scen: st.scen,
-      };
+
+    // (1) CMT: hướng + target
+    let state, target;
+    if (lastC > R) {
+      state = "RUN_UP";
+      target = R + 0.618 * range;
+    } else if (lastC < S) {
+      state = "RUN_DOWN";
+      target = null;
+    } else {
+      state = "IN_RANGE";
+      target = R;
+    }
+    if (state === "RUN_DOWN" || target == null || target <= lastC) continue;
+
+    // (2) Hurst chọn bộ chỉ báo theo regime của ngày j
+    const ph = phase[j];
+    const pool = ph === "TREND" ? trendDefs : ph === "RANGE" ? rangeDefs : null;
+    if (!pool) continue;
+    const consensus = netAt(pool, j);
+
+    // (3) Đồng thuận mua + giá vừa giảm → vào lệnh
+    const pulledBack = j >= 1 && closes[j] < closes[j - 1];
+    if (consensus > ENTRY_CONSENSUS_THR && pulledBack) {
+      const a = atr[j];
+      if (a == null || a <= 0) continue;
+      const slDist = a * opts.slMult;
+      const entry = lastC;
+      const stop = entry - slDist;
+      if (stop >= entry) continue;
+      pos = { i0: i, entry, stop, tp: target, slDist, state, phase: ph };
     }
   }
-  const folds = Math.max(2, opts.wfFolds);
-  const bnd = Array.from({ length: folds + 1 }, (_, k) =>
-    Math.floor((n * k) / folds)
-  );
-  const oosStart = bnd[1];
-  const oosTrades = trades.filter((t) => t.entryIdx >= oosStart);
-  const sim = simulateEquityDaily(oosTrades, closes, n, opts.riskPct);
+
+  // Trạng thái SỐNG tính tới phiên cuối cùng có dữ liệu
+  let live;
+  if (pos) {
+    const lastC = closes[n - 1];
+    live = {
+      active: true,
+      entryIdx: pos.i0,
+      entryDate: dates[pos.i0],
+      entryPrice: pos.entry,
+      stop: pos.stop,
+      tp: pos.tp,
+      cmtState: pos.state,
+      hurstPhase: pos.phase,
+      daysHeld: n - 1 - pos.i0,
+      unrealizedR: (lastC - pos.entry) / pos.slDist,
+      unrealizedPct: (lastC / pos.entry - 1) * 100,
+      openedToday: pos.i0 === n - 1,
+    };
+  } else {
+    const lastTrade = trades[trades.length - 1];
+    live = {
+      active: false,
+      lastExit: lastTrade
+        ? {
+            date: dates[lastTrade.exitIdx],
+            reason: lastTrade.exitReason,
+            R: lastTrade.R,
+            exitedToday: lastTrade.exitIdx === n - 1,
+          }
+        : null,
+    };
+  }
+
+  return { trades, live, start, warmupFromDate: dates[start] };
+}
+
+// Gói thống kê đầy đủ (tradeStats/winLoss/equity/theo đoạn/theo trạng thái
+// CMT lúc vào/Buy&Hold/live) từ danh sách lệnh thô của runCMTHurstLongRule.
+function summarizeRuleBacktest(engine, closes, dates, opts) {
+  const { trades, live, start } = engine;
+  const n = closes.length;
+  const sim = simulateEquityDaily(trades, closes, n, opts.riskPct);
   let cum = 0;
   const equity = [];
-  for (let i = oosStart; i < n; i++) {
+  for (let i = start; i < n; i++) {
     cum += sim.dailyReturns[i];
     equity.push({ d: dates[i], cum: cum * 100 });
   }
+  const folds = Math.max(2, opts.wfFolds);
+  const bnd = Array.from({ length: folds + 1 }, (_, k) =>
+    Math.floor(((n - start) * k) / folds) + start
+  );
   const foldStats = [];
-  for (let f = 1; f < folds; f++) {
+  for (let f = 0; f < folds; f++) {
     const ft = trades.filter(
       (t) => t.entryIdx >= bnd[f] && t.entryIdx < bnd[f + 1]
     );
     const wins = ft.filter((t) => t.R > 0).length;
     const totR = ft.reduce((s, t) => s + t.R, 0);
     foldStats.push({
-      fold: f,
+      fold: f + 1,
       from: dates[bnd[f]],
       to: dates[Math.min(n - 1, bnd[f + 1] - 1)],
       n: ft.length,
@@ -3378,7 +3455,7 @@ function backtestStrategyCards(closes, dates, opts, digits, highs, lows) {
     });
   }
   const byScen = {};
-  oosTrades.forEach((t) => {
+  trades.forEach((t) => {
     const k = t.scen || "?";
     byScen[k] = byScen[k] || { n: 0, win: 0, R: 0 };
     byScen[k].n++;
@@ -3386,17 +3463,18 @@ function backtestStrategyCards(closes, dates, opts, digits, highs, lows) {
     byScen[k].R += t.R;
   });
   return {
-    trades: oosTrades,
-    tradeStats: tradeStats(oosTrades, Math.max(n - oosStart, 1)),
-    winLoss: winLossStats(oosTrades, (t) => t.priceDiff),
+    trades,
+    tradeStats: tradeStats(trades, Math.max(n - start, 1)),
+    winLoss: winLossStats(trades, (t) => t.priceDiff),
     sim,
     equity,
     foldStats,
     byScen,
-    oosStart,
-    oosFromDate: dates[oosStart],
+    oosStart: start,
+    oosFromDate: dates[start],
     allCount: trades.length,
-    buyHold: buyHoldEquity(closes, dates, oosStart),
+    buyHold: buyHoldEquity(closes, dates, start),
+    live,
   };
 }
 
@@ -3685,13 +3763,11 @@ function runHurstAnalysis(closes, volumes, dates, opts, direction, digits, highs
     highs,
     lows
   );
-  const cardBacktest = backtestStrategyCards(
+  const cardBacktest = summarizeRuleBacktest(
+    runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts),
     closes,
     dates,
-    opts,
-    digits,
-    highs,
-    lows
+    opts
   );
 
   return {
@@ -3873,6 +3949,9 @@ function screenStock(cfg, closes, volumes, dates, opts, highs, lows) {
   // Kiểm tra chất lượng "mua theo hồi xu hướng" trên chính mã này — luôn
   // theo chiều LONG vì TTCK VN không bán khống, bất kể bias hiện tại là gì.
   const qb = quickPullbackBacktest(closes, "long", atr, opts.slMult, opts.riskPct, lows, highs);
+  // Trạng thái lệnh "sống" theo đúng luật CMT×Hurst (đang giữ từ khi nào,
+  // hay đang chờ tín hiệu) — hiển thị ngay trên Bộ lọc cho cả rổ VN30.
+  const live = runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts).live;
 
   const prob = analog
     ? bias === "up"
@@ -3934,6 +4013,7 @@ function screenStock(cfg, closes, volumes, dates, opts, highs, lows) {
     score,
     distPct: (Math.abs(dist) / last) * 100,
     spark: closes.slice(-90).map((c, i) => ({ i, c })),
+    live,
   };
   row.strategy = deriveStrategy(row);
   return row;
@@ -4295,8 +4375,8 @@ const CLR = {
   text: "#dbe4f5",
 };
 
-const Chip = ({ cls, children }) => (
-  <span className={`chip ${cls}`}>{children}</span>
+const Chip = ({ cls, children, style }) => (
+  <span className={`chip ${cls}`} style={style}>{children}</span>
 );
 const Warn = ({ children }) => (
   <div className="warn">
@@ -4917,6 +4997,114 @@ function StrategyModal({ row, onClose, onOpenCMT }) {
   );
 }
 
+function LiveDeskPanel({ rows, openStock }) {
+  const holding = rows
+    .filter((r) => r.live && r.live.active)
+    .sort((a, b) => new Date(b.live.entryDate) - new Date(a.live.entryDate));
+  const openedToday = holding.filter((r) => r.live.openedToday);
+  const closedToday = rows.filter(
+    (r) => r.live && !r.live.active && r.live.lastExit && r.live.lastExit.exitedToday
+  );
+  const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
+  const stateVN = { RUN_UP: "breakout", IN_RANGE: "trong biên" };
+  const fmtPct = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
+  return (
+    <Panel
+      mod="Bàn lệnh · Luật CMT × Hurst"
+      title={`Đang giữ ${holding.length} mã${
+        openedToday.length ? ` · mở mới hôm nay ${openedToday.length}` : ""
+      }${closedToday.length ? ` · đóng hôm nay ${closedToday.length}` : ""}`}
+      sub="Luật: (1) CMT xác định hướng + TP theo R/S thật · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) vào lệnh khi bộ chỉ báo đồng thuận mua và giá vừa giảm (mua theo nhịp). SL = ATR×hệ số. Chỉ Long."
+    >
+      {holding.length === 0 ? (
+        <p className="sub">
+          Hiện không có mã VN30 nào đang mở lệnh theo luật này — tất cả đang
+          chờ tín hiệu.
+        </p>
+      ) : (
+        <div style={{ overflowX: "auto" }}>
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>Mã</th>
+                <th>Vào từ</th>
+                <th>Số phiên giữ</th>
+                <th>Giá vào</th>
+                <th>SL</th>
+                <th>TP</th>
+                <th>Lãi/lỗ tạm tính</th>
+                <th>Bối cảnh lúc vào</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {holding.map((r) => (
+                <tr key={r.key} className={r.live.openedToday ? "hot" : undefined}>
+                  <td style={{ fontWeight: 800 }}>{r.label}</td>
+                  <td className="num">
+                    {r.live.entryDate}
+                    {r.live.openedToday && (
+                      <Chip cls="up" style={{ marginLeft: 6 }}>
+                        MỞ HÔM NAY
+                      </Chip>
+                    )}
+                  </td>
+                  <td className="num">{r.live.daysHeld}</td>
+                  <td className="num">{r.live.entryPrice.toLocaleString("vi-VN")}</td>
+                  <td className="num" style={{ color: CLR.bear }}>
+                    {r.live.stop.toLocaleString("vi-VN")}
+                  </td>
+                  <td className="num" style={{ color: CLR.bull }}>
+                    {r.live.tp.toLocaleString("vi-VN")}
+                  </td>
+                  <td
+                    className="num"
+                    style={{
+                      fontWeight: 700,
+                      color: r.live.unrealizedPct >= 0 ? CLR.bull : CLR.bear,
+                    }}
+                  >
+                    {fmtPct(r.live.unrealizedPct)} ({r.live.unrealizedR.toFixed(2)}R)
+                  </td>
+                  <td style={{ color: CLR.mut, fontSize: 12 }}>
+                    {stateVN[r.live.cmtState] || r.live.cmtState} · Hurst {r.live.hurstPhase}
+                  </td>
+                  <td>
+                    <button className="bt" onClick={() => openStock(r.key)}>
+                      Xem →
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {closedToday.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <div className="sub" style={{ marginBottom: 6 }}>
+            Đóng lệnh hôm nay
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {closedToday.map((r) => (
+              <Chip key={r.key} cls={r.live.lastExit.R >= 0 ? "up" : "down"}>
+                {r.label}: {reasonVN[r.live.lastExit.reason] || r.live.lastExit.reason} (
+                {r.live.lastExit.R >= 0 ? "+" : ""}
+                {r.live.lastExit.R.toFixed(2)}R)
+              </Chip>
+            ))}
+          </div>
+        </div>
+      )}
+      <p className="sub" style={{ marginTop: 10, fontSize: 11 }}>
+        Tính bằng phiên bản nhanh (không dò walk-forward) của luật để chạy
+        được cho cả 30 mã — xem tab Hurst của từng mã để có bản backtest đầy
+        đủ (equity, so với Mua & Giữ, xếp hạng chỉ báo).
+      </p>
+    </Panel>
+  );
+}
+
 function ScreenerSection({ rows, openStock }) {
   const [sortKey, setSortKey] = useState("score");
   const [onlyRunning, setOnlyRunning] = useState(false);
@@ -4945,6 +5133,7 @@ function ScreenerSection({ rows, openStock }) {
 
   return (
     <>
+      <LiveDeskPanel rows={rows} openStock={openStock} />
       <Panel
         mod="Bộ lọc · Tín hiệu CMT"
         title="Mã VN30 nào xác suất cao và đang chạy?"
@@ -5053,6 +5242,7 @@ function ScreenerSection({ rows, openStock }) {
               <tr>
                 <th>#</th>
                 <th>Mã</th>
+                <th>Lệnh (luật CMT×Hurst)</th>
                 <th>90 phiên</th>
                 <th>Trạng thái</th>
                 <th>Bằng chứng</th>
@@ -5097,6 +5287,20 @@ function ScreenerSection({ rows, openStock }) {
                     >
                       {r.label}
                     </button>
+                  </td>
+                  <td style={{ fontSize: 12 }}>
+                    {r.live && r.live.active ? (
+                      <span style={{ color: CLR.bull, fontWeight: 700 }}>
+                        Đang giữ từ {r.live.entryDate}
+                        {r.live.openedToday ? " · MỚI" : ` (${r.live.daysHeld}p)`}
+                      </span>
+                    ) : r.live && r.live.lastExit && r.live.lastExit.exitedToday ? (
+                      <span style={{ color: CLR.amber, fontWeight: 700 }}>
+                        Vừa đóng hôm nay
+                      </span>
+                    ) : (
+                      <span style={{ color: CLR.dim }}>Chờ tín hiệu</span>
+                    )}
                   </td>
                   <td style={{ padding: "2px 8px" }}>
                     <div style={{ width: 96, height: 28 }}>
@@ -7653,23 +7857,70 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
           ts = cb.tradeStats,
           wl = cb.winLoss;
         const scenName = {
-          "reject-S": "Mua tại hỗ trợ (fade)",
-          A: "Mua theo tiếp diễn phá lên",
-          "false-B": "Mua khi bear-trap đảo chiều",
+          RUN_UP: "Mua theo pullback trong breakout",
+          IN_RANGE: "Mua theo pullback trong biên",
         };
         const scenRows = Object.entries(cb.byScen).sort((a, b) => b[1].n - a[1].n);
+        const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
+        const stateVN2 = { RUN_UP: "breakout", IN_RANGE: "trong biên" };
         return (
           <Panel
-            mod="Hurst · Backtest thẻ chiến lược"
-            title={`${cfg.label} — nếu bám theo thẻ chiến lược thì lời/lỗ ra sao?`}
-            sub={`Mỗi phiên dựng lại đúng thẻ (vị trí giá + xác suất A/B/C tính CAUSAL), nếu thẻ cho lệnh vào-ngay thì vào lệnh với SL/TP của chính thẻ. Vốn ${fmtMoney(
-              capital.value
-            )}, rủi ro ${riskPctIn.value}%/lệnh. OOS từ ${cb.oosFromDate}.`}
+            mod="Hurst · Backtest theo luật CMT × Hurst"
+            title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
+            sub={`Luật: (1) CMT xác định hướng + TP theo R/S thật · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. SL = ATR×${opts.slMult.toFixed(
+              1
+            )}. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
           >
+            <div
+              style={{
+                display: "flex",
+                gap: 8,
+                flexWrap: "wrap",
+                marginBottom: 12,
+                padding: "10px 12px",
+                border: `1px solid ${CLR.line}`,
+                borderRadius: 10,
+                background: "#1a2440",
+              }}
+            >
+              {cb.live.active ? (
+                <>
+                  <Chip cls="up">
+                    ● Đang giữ từ {cb.live.entryDate}
+                    {cb.live.openedToday ? " (MỚI HÔM NAY)" : ` (${cb.live.daysHeld} phiên)`}
+                  </Chip>
+                  <Chip cls="mut">
+                    Vào {cb.live.entryPrice.toLocaleString("vi-VN")} · SL{" "}
+                    {cb.live.stop.toLocaleString("vi-VN")} · TP{" "}
+                    {cb.live.tp.toLocaleString("vi-VN")}
+                  </Chip>
+                  <Chip cls={cb.live.unrealizedPct >= 0 ? "up" : "down"}>
+                    Tạm tính {cb.live.unrealizedPct >= 0 ? "+" : ""}
+                    {cb.live.unrealizedPct.toFixed(1)}% ({cb.live.unrealizedR.toFixed(2)}R)
+                  </Chip>
+                  <Chip cls="mut">
+                    Bối cảnh: {stateVN2[cb.live.cmtState] || cb.live.cmtState} · Hurst {cb.live.hurstPhase}
+                  </Chip>
+                </>
+              ) : (
+                <>
+                  <Chip cls="side">● Đang chờ tín hiệu — chưa có lệnh mở</Chip>
+                  {cb.live.lastExit && (
+                    <Chip cls={cb.live.lastExit.R >= 0 ? "up" : "down"}>
+                      Lệnh gần nhất đóng {cb.live.lastExit.date} —{" "}
+                      {reasonVN[cb.live.lastExit.reason] || cb.live.lastExit.reason} (
+                      {cb.live.lastExit.R >= 0 ? "+" : ""}
+                      {cb.live.lastExit.R.toFixed(2)}R)
+                      {cb.live.lastExit.exitedToday ? " · HÔM NAY" : ""}
+                    </Chip>
+                  )}
+                </>
+              )}
+            </div>
             {cb.trades.length < 5 ? (
               <Warn>
-                Chỉ có {cb.trades.length} lệnh trong kỳ OOS — quá ít để kết
-                luận.
+                Chỉ có {cb.trades.length} lệnh trong giai đoạn mô phỏng — quá
+                ít để kết luận.
               </Warn>
             ) : (
               <>
@@ -7725,7 +7976,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                 </div>
                 <div className="grid2" style={{ marginTop: 14 }}>
                   <div>
-                    <div className="sub" style={{ marginBottom: 4 }}>Theo loại thẻ</div>
+                    <div className="sub" style={{ marginBottom: 4 }}>Theo bối cảnh CMT lúc vào</div>
                     <table className="tbl">
                       <thead>
                         <tr><th>Loại lệnh</th><th>Số</th><th>Thắng</th><th>Tổng R</th></tr>
@@ -8053,8 +8304,15 @@ export default function App() {
   }, [reload]);
 
   const screenOpts = useMemo(
-    () => ({ atrPeriod: opts.atrPeriod, slMult: opts.slMult, riskPct: Math.max(0.1, riskPctIn) / 100 }),
-    [opts.atrPeriod, opts.slMult, riskPctIn]
+    () => ({
+      atrPeriod: opts.atrPeriod,
+      slMult: opts.slMult,
+      riskPct: Math.max(0.1, riskPctIn) / 100,
+      hurstWin: opts.hurstWin,
+      hurstStep: opts.hurstStep,
+      cardMaxHold: opts.cardMaxHold,
+    }),
+    [opts.atrPeriod, opts.slMult, riskPctIn, opts.hurstWin, opts.hurstStep, opts.cardMaxHold]
   );
 
   const screener = useMemo(() => {
