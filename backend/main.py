@@ -13,6 +13,7 @@ Deploy: see ../README.md for Render instructions.
 
 import os
 import time
+import traceback
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -72,7 +73,7 @@ def get_stock_history(
     start: str = Query(..., description="YYYY-MM-DD"),
     end: str = Query(..., description="YYYY-MM-DD"),
     interval: str = Query("1D", description="1D, 1W, 1M"),
-    source: str = Query("TCBS", description="VCI, TCBS, MSN, ..."),
+    source: str = Query("VCI", description="VCI, TCBS, MSN, ..."),
 ):
     symbol = symbol.upper()
     key = f"stock:{symbol}:{start}:{end}:{interval}:{source}"
@@ -82,7 +83,8 @@ def get_stock_history(
             stock = Vnstock().stock(symbol=symbol, source=source)
             df = stock.quote.history(start=start, end=end, interval=interval)
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"vnstock error: {exc}") from exc
+            traceback.print_exc()
+            raise HTTPException(status_code=502, detail=f"vnstock error ({type(exc).__name__}): {exc}") from exc
         if df is None or df.empty:
             raise HTTPException(status_code=404, detail=f"No data for symbol '{symbol}'")
         return df.to_dict(orient="records")
@@ -106,10 +108,11 @@ def get_index_history(
 
     def loader():
         try:
-            stock = Vnstock().stock(symbol=code, source="TCBS")
+            stock = Vnstock().stock(symbol=code, source="VCI")
             df = stock.quote.history(start=start, end=end)
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"vnstock error: {exc}") from exc
+            traceback.print_exc()
+            raise HTTPException(status_code=502, detail=f"vnstock error ({type(exc).__name__}): {exc}") from exc
         if df is None or df.empty:
             raise HTTPException(status_code=404, detail=f"No data for index '{code}'")
         return df.to_dict(orient="records")
@@ -132,7 +135,8 @@ def list_symbols(exchange: Optional[str] = Query("HOSE,HNX,UPCOM")):
 
             df = Screener().stock(params={"exchangeName": exchange}, limit=2000)
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"vnstock error: {exc}") from exc
+            traceback.print_exc()
+            raise HTTPException(status_code=502, detail=f"vnstock error ({type(exc).__name__}): {exc}") from exc
         if df is None or df.empty:
             raise HTTPException(status_code=404, detail="No symbols found")
         cols = [c for c in ["ticker", "exchange", "industry"] if c in df.columns]
