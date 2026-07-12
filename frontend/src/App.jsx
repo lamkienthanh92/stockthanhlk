@@ -87,14 +87,20 @@ function normalizeRows(rows) {
     highs = [],
     lows = [],
     volumes = [];
+  // vnstock trả giá theo đơn vị "nghìn đồng" (VD: HPG ra 22.95 nghĩa là
+  // 22.950đ thật) — nhân 1000 ngay tại đây để toàn bộ app (giá hiển thị,
+  // ATR, SL/TP, lãi lỗ theo VND, quy mô vị thế) tính bằng VND thật. Các chỉ
+  // số theo tỷ lệ (%, R-multiple, Sharpe) không đổi vì đơn vị tự triệt tiêu,
+  // chỉ những con số tiền tuyệt đối trước đây bị hiển thị nhỏ hơn 1000 lần.
+  const SCALE = 1000;
   for (const r of rows || []) {
     const d = (r.time || r.date || r.tradingDate || "").toString().slice(0, 10);
     if (!d || r.close == null) continue;
     dates.push(d);
-    closes.push(+r.close);
-    opens.push(r.open != null ? +r.open : +r.close);
-    highs.push(r.high != null ? +r.high : +r.close);
-    lows.push(r.low != null ? +r.low : +r.close);
+    closes.push(+r.close * SCALE);
+    opens.push((r.open != null ? +r.open : +r.close) * SCALE);
+    highs.push((r.high != null ? +r.high : +r.close) * SCALE);
+    lows.push((r.low != null ? +r.low : +r.close) * SCALE);
     volumes.push(r.volume != null ? +r.volume : 0);
   }
   return { dates, closes, opens, highs, lows, volumes };
