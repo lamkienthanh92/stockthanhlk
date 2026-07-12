@@ -14,10 +14,11 @@ Deploy: see ../README.md for Render instructions.
 import os
 import time
 import traceback
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from vnstock import Vnstock
 
 # ---------------------------------------------------------------------------
@@ -28,13 +29,23 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",
 
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 minutes
 SYMBOLS_CACHE_TTL_SECONDS = int(os.getenv("SYMBOLS_CACHE_TTL_SECONDS", "86400"))  # 1 day
+DEFAULT_SOURCE = os.getenv("VNSTOCK_SOURCE", "KBS")
 
-app = FastAPI(title="VN Stock API", version="1.0.0")
+# VN30 — danh sách cố định (cập nhật tay khi HOSE công bố kỳ review mới).
+# Dùng làm rổ mặc định cho Screener để tránh quét toàn thị trường (nhiều nghìn mã)
+# gây quá tải backend free-tier.
+VN30 = [
+    "ACB", "BCM", "BID", "BVH", "CTG", "FPT", "GAS", "GVR", "HDB", "HPG",
+    "MBB", "MSN", "MWG", "PLX", "POW", "SAB", "SHB", "SSB", "SSI", "STB",
+    "TCB", "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VRE",
+]
+
+app = FastAPI(title="VN Stock API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -55,6 +66,27 @@ def cache_get_or_set(key: str, ttl: int, loader):
     return data
 
 
+def load_history(symbol: str, start: str, end: str, interval: str, source: str):
+    symbol = symbol.upper()
+    key = f"stock:{symbol}:{start}:{end}:{interval}:{source}"
+
+    def loader():
+        try:
+            stock = Vnstock().stock(symbol=symbol, source=source)
+            df = stock.quote.history(start=start, end=end, interval=interval)
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=502,
+                detail=f"vnstock error ({type(exc).__name__}): {exc}",
+            ) from exc
+        if df is None or df.empty:
+            return []
+        return df.to_dict(orient="records")
+
+    return cache_get_or_set(key, CACHE_TTL_SECONDS, loader)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -65,34 +97,54 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/vn30")
+def get_vn30():
+    """Danh sách mã VN30 dùng cho Screener."""
+    return {"symbols": VN30}
+
+
 @app.get("/api/stock/{symbol}")
 def get_stock_history(
     symbol: str,
     start: str = Query(..., description="YYYY-MM-DD"),
     end: str = Query(..., description="YYYY-MM-DD"),
     interval: str = Query("1D", description="1D, 1W, 1M"),
-    source: str = Query("KBS", description="KBS, VCI, TCBS, MSN, ..."),
+    source: str = Query(DEFAULT_SOURCE, description="KBS, VCI, TCBS, MSN, ..."),
 ):
-    symbol = symbol.upper()
-    key = f"stock:{symbol}:{start}:{end}:{interval}:{source}"
+    data = load_history(symbol, start, end, interval, source)
+    if not data:
+        raise HTTPException(status_code=404, detail=f"No data for symbol '{symbol}'")
+    return data
 
-    def loader():
+
+class BatchRequest(BaseModel):
+    symbols: List[str]
+    start: str
+    end: str
+    interval: str = "1D"
+    source: str = DEFAULT_SOURCE
+
+
+@app.post("/api/batch")
+def get_batch_history(req: BatchRequest):
+    """
+    Lấy lịch sử giá cho NHIỀU mã trong 1 lần gọi — dùng cho Screener (VN30)
+    để tránh 30 request riêng lẻ từ frontend. Mỗi mã vẫn dùng cache TTL riêng
+    (cache_get_or_set) nên các lần load lại sau sẽ rất nhanh.
+    Mã nào lỗi thì trả về error cho mã đó, không làm hỏng cả batch.
+    """
+    out = {}
+    for sym in req.symbols:
+        sym_u = sym.upper()
         try:
-            stock = Vnstock().stock(symbol=symbol, source=source)
-            df = stock.quote.history(start=start, end=end, interval=interval)
+            data = load_history(sym_u, req.start, req.end, req.interval, req.source)
+            out[sym_u] = {"ok": True, "data": data}
+        except HTTPException as exc:
+            out[sym_u] = {"ok": False, "error": str(exc.detail)}
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
-            raise HTTPException(status_code=502, detail=f"vnstock error ({type(exc).__name__}): {exc}") from exc
-        if df is None or df.empty:
-            raise HTTPException(status_code=404, detail=f"No data for symbol '{symbol}'")
-        return df.to_dict(orient="records")
-
-    try:
-        return cache_get_or_set(key, CACHE_TTL_SECONDS, loader)
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+            out[sym_u] = {"ok": False, "error": str(exc)}
+    return out
 
 
 @app.get("/api/index/{code}")
@@ -101,26 +153,10 @@ def get_index_history(
     start: str = Query(..., description="YYYY-MM-DD"),
     end: str = Query(..., description="YYYY-MM-DD"),
 ):
-    code = code.upper()
-    key = f"index:{code}:{start}:{end}"
-
-    def loader():
-        try:
-            stock = Vnstock().stock(symbol=code, source="KBS")
-            df = stock.quote.history(start=start, end=end)
-        except Exception as exc:  # noqa: BLE001
-            traceback.print_exc()
-            raise HTTPException(status_code=502, detail=f"vnstock error ({type(exc).__name__}): {exc}") from exc
-        if df is None or df.empty:
-            raise HTTPException(status_code=404, detail=f"No data for index '{code}'")
-        return df.to_dict(orient="records")
-
-    try:
-        return cache_get_or_set(key, CACHE_TTL_SECONDS, loader)
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    data = load_history(code, start, end, "1D", DEFAULT_SOURCE)
+    if not data:
+        raise HTTPException(status_code=404, detail=f"No data for index '{code}'")
+    return data
 
 
 @app.get("/api/symbols")
