@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: vn-stock-api
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: "http://localhost:5173"
+      - key: CACHE_TTL_SECONDS
+        value: "900"
