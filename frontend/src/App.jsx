@@ -3376,7 +3376,11 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
 
   const trades = [];
   let pos = null;
-  const maxHold = opts.cardMaxHold || 30;
+  // TP nằm ở khung tuần (có thể là một move kéo dài nhiều tuần) nên thời
+  // gian giữ tối đa phải đủ rộng để mục tiêu có cơ hội chạm tới — mặc định
+  // 120 phiên (~24 tuần); đặt quá ngắn sẽ khiến phần lớn lệnh bị "hết hạn
+  // giữ" trước khi kịp đạt TP, kéo kết quả xuống dù R:R mỗi lệnh vẫn tốt.
+  const maxHold = opts.cardMaxHold || 120;
   const start = Math.max(300, opts.hurstWin + 10);
 
   for (let i = start; i < n; i++) {
@@ -7621,7 +7625,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
       <Panel
         mod="Hurst · Tham số mô phỏng"
         title="Vốn & rủi ro của bạn"
-        sub="Áp cho backtest và mô phỏng tài khoản. TTCK VN không có bán khống nên toàn bộ hệ thống chỉ mở lệnh Mua (Long) — khi CMT báo breakdown, hệ thống đứng ngoài thay vì mở lệnh ngược."
+        sub="Áp cho backtest và mô phỏng tài khoản. TTCK VN không có bán khống nên toàn bộ hệ thống chỉ mở lệnh Mua (Long) — khi CMT báo breakdown, hệ thống đứng ngoài thay vì mở lệnh ngược. TP nay tính theo khung tuần nên 'Giữ tối đa' cần đủ rộng để mục tiêu có cơ hội chạm tới."
       >
         <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-end" }}>
           <div>
@@ -7683,6 +7687,18 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
               max="12"
               value={opts.wfFolds}
               onChange={(e) => setOpt("wfFolds", Math.max(2, Math.min(12, +e.target.value || 5)))}
+            />
+          </div>
+          <div>
+            <label className="lb">Giữ tối đa (phiên) — luật tuần</label>
+            <input
+              className="inp"
+              style={{ width: 90 }}
+              type="number"
+              min="20"
+              max="500"
+              value={opts.cardMaxHold}
+              onChange={(e) => setOpt("cardMaxHold", Math.max(20, Math.min(500, +e.target.value || 120)))}
             />
           </div>
           <div>
@@ -8332,7 +8348,7 @@ export default function App() {
     minTrendStrength: 0,
     minPullbackATR: 0,
     rangeEnterThr: 0.2,
-    cardMaxHold: 30,
+    cardMaxHold: 120,
   });
 
   useEffect(() => {
