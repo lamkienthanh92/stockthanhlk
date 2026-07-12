@@ -24,8 +24,6 @@ from vnstock import Vnstock
 # Config
 # ---------------------------------------------------------------------------
 
-# Comma-separated list of allowed frontend origins, e.g.
-# "https://your-app.netlify.app,http://localhost:5173"
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
 
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 minutes
@@ -73,7 +71,7 @@ def get_stock_history(
     start: str = Query(..., description="YYYY-MM-DD"),
     end: str = Query(..., description="YYYY-MM-DD"),
     interval: str = Query("1D", description="1D, 1W, 1M"),
-    source: str = Query("VCI", description="VCI, TCBS, MSN, ..."),
+    source: str = Query("KBS", description="KBS, VCI, TCBS, MSN, ..."),
 ):
     symbol = symbol.upper()
     key = f"stock:{symbol}:{start}:{end}:{interval}:{source}"
@@ -108,7 +106,7 @@ def get_index_history(
 
     def loader():
         try:
-            stock = Vnstock().stock(symbol=code, source="VCI")
+            stock = Vnstock().stock(symbol=code, source="KBS")
             df = stock.quote.history(start=start, end=end)
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
