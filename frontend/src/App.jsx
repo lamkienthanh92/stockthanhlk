@@ -212,6 +212,36 @@ function closeATR(closes, period) {
   }
   return out;
 }
+// ATR thật (Wilder) dùng High/Low/Close — chính xác hơn closeATR vì tính đủ
+// biên độ trong phiên (gap, râu nến), không chỉ khoảng cách giữa 2 giá đóng cửa.
+function trueRangeSeries(highs, lows, closes) {
+  const n = closes.length,
+    tr = Array(n).fill(null);
+  for (let i = 0; i < n; i++) {
+    if (i === 0) {
+      tr[i] = highs[i] - lows[i];
+      continue;
+    }
+    tr[i] = Math.max(
+      highs[i] - lows[i],
+      Math.abs(highs[i] - closes[i - 1]),
+      Math.abs(lows[i] - closes[i - 1])
+    );
+  }
+  return tr;
+}
+function atrTrue(highs, lows, closes, period) {
+  const tr = trueRangeSeries(highs, lows, closes);
+  const n = closes.length,
+    out = Array(n).fill(null);
+  if (n <= period) return out;
+  let s = 0;
+  for (let i = 1; i <= period; i++) s += tr[i];
+  out[period] = s / period;
+  for (let i = period + 1; i < n; i++)
+    out[i] = (out[i - 1] * (period - 1) + tr[i]) / period;
+  return out;
+}
 function pearson(a, b) {
   const n = Math.min(a.length, b.length);
   if (n < 3) return 0;
@@ -231,14 +261,29 @@ function pearson(a, b) {
 }
 const returns = (cl) => cl.slice(1).map((c, i) => c / cl[i] - 1);
 
-function pivots(closes, k) {
+// Đỉnh/đáy swing. Nếu có highs/lows thật (chuẩn CMT: đỉnh lấy từ dãy High,
+// đáy lấy từ dãy Low) thì dùng đúng giá cao/thấp trong phiên — chính xác hơn
+// so với chỉ dùng giá đóng cửa (vốn có thể bỏ lỡ râu nến). Không truyền
+// highs/lows thì tự động rơi về hành vi cũ (dùng closes cho cả hai loại).
+function pivots(closes, k, highs, lows) {
+  const H = highs || closes,
+    L = lows || closes;
   const out = [];
   for (let i = k; i < closes.length - k; i++) {
-    const seg = closes.slice(i - k, i + k + 1);
-    if (closes[i] >= Math.max(...seg))
-      out.push({ i, price: closes[i], type: "H" });
-    else if (closes[i] <= Math.min(...seg))
-      out.push({ i, price: closes[i], type: "L" });
+    const segH = H.slice(i - k, i + k + 1);
+    const segL = L.slice(i - k, i + k + 1);
+    const isH = H[i] >= Math.max(...segH);
+    const isL = L[i] <= Math.min(...segL);
+    if (isH && !isL) out.push({ i, price: H[i], type: "H" });
+    else if (isL && !isH) out.push({ i, price: L[i], type: "L" });
+    else if (isH && isL) {
+      // hiếm khi cả hai cùng đúng (nến rất hẹp) — ưu tiên theo hướng nến
+      out.push({
+        i,
+        price: closes[i] >= closes[Math.max(0, i - 1)] ? H[i] : L[i],
+        type: closes[i] >= closes[Math.max(0, i - 1)] ? "H" : "L",
+      });
+    }
   }
   const f = [];
   out.forEach((p) => {
@@ -252,6 +297,51 @@ function pivots(closes, k) {
     } else f.push(p);
   });
   return f;
+}
+// Gộp High/Low theo tuần & tháng (High tuần = max các High trong tuần, Low
+// tuần = min các Low trong tuần) — để tính swing đa khung bằng dữ liệu H/L
+// thật, không chỉ suy từ giá đóng cửa cuối kỳ.
+function aggWeeklyHL(highs, lows, dates) {
+  const oh = [],
+    ol = [],
+    wd = [];
+  let cur = null;
+  highs.forEach((h, i) => {
+    const dt = new Date(dates[i] + "T00:00:00Z");
+    const day = (dt.getUTCDay() + 6) % 7;
+    const mon = new Date(dt);
+    mon.setUTCDate(dt.getUTCDate() - day);
+    const key = mon.toISOString().slice(0, 10);
+    if (key !== cur) {
+      oh.push(h);
+      ol.push(lows[i]);
+      wd.push(key);
+      cur = key;
+    } else {
+      oh[oh.length - 1] = Math.max(oh[oh.length - 1], h);
+      ol[ol.length - 1] = Math.min(ol[ol.length - 1], lows[i]);
+    }
+  });
+  return { highs: oh, lows: ol, dates: wd };
+}
+function aggMonthlyHL(highs, lows, dates) {
+  const oh = [],
+    ol = [],
+    md = [];
+  let cur = null;
+  highs.forEach((h, i) => {
+    const key = dates[i].slice(0, 7);
+    if (key !== cur) {
+      oh.push(h);
+      ol.push(lows[i]);
+      md.push(key + "-01");
+      cur = key;
+    } else {
+      oh[oh.length - 1] = Math.max(oh[oh.length - 1], h);
+      ol[ol.length - 1] = Math.min(ol[ol.length - 1], lows[i]);
+    }
+  });
+  return { highs: oh, lows: ol, dates: md };
 }
 function dowTrend(piv) {
   const H = piv.filter((p) => p.type === "H").slice(-2);
@@ -297,16 +387,18 @@ function aggMonthly(closes, dates) {
   });
   return { closes: out, dates: md };
 }
-function stepDownCascade(dCloses, dDates) {
+function stepDownCascade(dCloses, dDates, dHighs, dLows) {
   const wk = aggWeekly(dCloses, dDates);
   const mo = aggMonthly(dCloses, dDates);
+  const wkHL = dHighs ? aggWeeklyHL(dHighs, dLows, dDates) : null;
+  const moHL = dHighs ? aggMonthlyHL(dHighs, dLows, dDates) : null;
   const med = (arr) => {
     if (!arr.length) return null;
     const s = [...arr].sort((a, b) => a - b);
     return s[Math.floor(s.length / 2)];
   };
-  const swingsOf = (closes, k) => {
-    const piv = pivots(closes, k);
+  const swingsOf = (closes, k, highs, lows) => {
+    const piv = pivots(closes, k, highs, lows);
     const amps = [],
       durs = [];
     for (let i = 1; i < piv.length; i++) {
@@ -318,9 +410,9 @@ function stepDownCascade(dCloses, dDates) {
     }
     return { medAmpl: med(amps), medDur: med(durs), n: amps.length };
   };
-  const M = swingsOf(mo.closes, 2),
-    W = swingsOf(wk.closes, 2),
-    D = swingsOf(dCloses, 4);
+  const M = swingsOf(mo.closes, 2, moHL && moHL.highs, moHL && moHL.lows),
+    W = swingsOf(wk.closes, 2, wkHL && wkHL.highs, wkHL && wkHL.lows),
+    D = swingsOf(dCloses, 4, dHighs, dLows);
   const rMW = M.medAmpl && W.medAmpl ? M.medAmpl / W.medAmpl : null;
   const rWD = W.medAmpl && D.medAmpl ? W.medAmpl / D.medAmpl : null;
   const consistent =
@@ -567,8 +659,8 @@ function elliottScenarios(piv, digits) {
   return scen;
 }
 
-function scanPatternHistory(closes, dates) {
-  const piv = pivots(closes, 4);
+function scanPatternHistory(closes, dates, highs, lows) {
+  const piv = pivots(closes, 4, highs, lows);
   const vp = volProxy(closes);
   const events = [];
   const outcome = (startI, dir, target, invalid) => {
@@ -657,15 +749,18 @@ function scanPatternHistory(closes, dates) {
   return uniq;
 }
 
-function scanBreakoutRule(closes) {
+function scanBreakoutRule(closes, highs, lows) {
+  const H_ = highs || closes,
+    L_ = lows || closes;
   const mk = () => ({ n: 0, hit: 0, fail: 0, open: 0 });
   const st = { up: mk(), down: mk() };
   let skipTo = -1;
   for (let i = 45; i < closes.length - 1; i++) {
     if (i < skipTo) continue;
-    const win = closes.slice(i - 40, i);
-    const R = Math.max(...win),
-      S = Math.min(...win);
+    const winH = H_.slice(i - 40, i),
+      winL = L_.slice(i - 40, i);
+    const R = Math.max(...winH),
+      S = Math.min(...winL);
     const range = R - S;
     if (range <= 0) continue;
     let dir = null;
@@ -698,10 +793,10 @@ function scanBreakoutRule(closes) {
   };
 }
 
-function backtestConfluenceRolling(closes) {
+function backtestConfluenceRolling(closes, highs, lows) {
   const rsiArr = rsi(closes),
     vp = volProxy(closes),
-    piv = pivots(closes, 4);
+    piv = pivots(closes, 4, highs, lows);
   const trades = [];
   let pi = 0;
   const H = [],
@@ -731,11 +826,13 @@ function backtestConfluenceRolling(closes) {
   };
 }
 
-function buildStates(closes) {
+function buildStates(closes, highs, lows) {
+  const H_ = highs || closes,
+    L_ = lows || closes;
   const ma50 = sma(closes, 50);
   const rsiArr = rsi(closes),
     mac = macd(closes),
-    piv = pivots(closes, 4);
+    piv = pivots(closes, 4, highs, lows);
   const states = new Array(closes.length).fill(null);
   let pi = 0;
   const H = [],
@@ -749,9 +846,10 @@ function buildStates(closes) {
     const hh = H[H.length - 1].price > H[H.length - 2].price;
     const hl = L[L.length - 1].price > L[L.length - 2].price;
     const dow = hh && hl ? "u" : !hh && !hl ? "d" : "s";
-    const win = closes.slice(i - 40, i);
-    const R = Math.max(...win),
-      S = Math.min(...win);
+    const winH = H_.slice(i - 40, i),
+      winL = L_.slice(i - 40, i);
+    const R = Math.max(...winH),
+      S = Math.min(...winL);
     const pos = (closes[i] - S) / (R - S || 1e-9);
     const r = rsiArr[i];
     states[i] = {
@@ -875,12 +973,16 @@ function analogAt(closes, states, asOf, horizon = 20) {
   return null;
 }
 
-function backtestSystem(closes) {
+function backtestSystem(closes, highs, lows) {
+  // Chỉ kiểm chứng phía MUA (long) — TTCK VN không có bán khống nên
+  // kịch bản "breakout xuống" không sinh ra một lệnh nào để test.
+  const H_ = highs || closes,
+    L_ = lows || closes;
   const ma50 = sma(closes, 50),
     ma200 = sma(closes, 200);
   const rsiArr = rsi(closes),
     mac = macd(closes),
-    piv = pivots(closes, 4),
+    piv = pivots(closes, 4, highs, lows),
     vp = volProxy(closes);
   let pi = 0;
   const H = [],
@@ -891,14 +993,11 @@ function backtestSystem(closes) {
     inRaw = null;
   const manage = (pos, book, c, i) => {
     if (!pos) return null;
-    const win = pos.dir === "up" ? c >= pos.t1 : c <= pos.t1;
-    const loss = pos.dir === "up" ? c < pos.inv : c > pos.inv;
+    const win = c >= pos.t1;
+    const loss = c < pos.inv;
     if (win || loss || i - pos.i0 >= 30) {
       const exitP = win ? pos.t1 : c;
-      book.trades.push(
-        (pos.dir === "up" ? exitP - pos.entry : pos.entry - exitP) /
-          (pos.u || 1e-9)
-      );
+      book.trades.push((exitP - pos.entry) / (pos.u || 1e-9));
       return null;
     }
     return pos;
@@ -912,41 +1011,29 @@ function backtestSystem(closes) {
     inSys = manage(inSys, sys, c, i);
     inRaw = manage(inRaw, raw, c, i);
     if (H.length < 2 || L.length < 2) continue;
-    const win40 = closes.slice(i - 40, i);
-    const R = Math.max(...win40),
-      S = Math.min(...win40);
+    const winH = H_.slice(i - 40, i),
+      winL = L_.slice(i - 40, i);
+    const R = Math.max(...winH),
+      S = Math.min(...winL);
     const range = R - S;
     if (range <= 0) continue;
-    let dir = null;
-    if (c > R && closes[i - 1] <= R) dir = "up";
-    else if (c < S && closes[i - 1] >= S) dir = "down";
-    if (!dir) continue;
+    if (!(c > R && closes[i - 1] <= R)) continue; // chỉ xét breakout LÊN
     const hh = H[H.length - 1].price > H[H.length - 2].price;
     const hl = L[L.length - 1].price > L[L.length - 2].price;
-    const conds =
-      dir === "up"
-        ? [
-            hh && hl,
-            ma50[i] != null && c > ma50[i],
-            ma50[i] != null && ma200[i] != null && ma50[i] > ma200[i],
-            rsiArr[i] != null && rsiArr[i] > 50,
-            mac[i].hist > 0,
-          ]
-        : [
-            !hh && !hl,
-            ma50[i] != null && c < ma50[i],
-            ma50[i] != null && ma200[i] != null && ma50[i] < ma200[i],
-            rsiArr[i] != null && rsiArr[i] < 50,
-            mac[i].hist < 0,
-          ];
+    const conds = [
+      hh && hl,
+      ma50[i] != null && c > ma50[i],
+      ma50[i] != null && ma200[i] != null && ma50[i] > ma200[i],
+      rsiArr[i] != null && rsiArr[i] > 50,
+      mac[i].hist > 0,
+    ];
     const score = conds.filter(Boolean).length;
     const pos = {
-      dir,
       entry: c,
       i0: i,
       u: vp[i],
-      t1: dir === "up" ? R + 0.618 * range : S - 0.618 * range,
-      inv: dir === "up" ? R : S,
+      t1: R + 0.618 * range,
+      inv: R,
     };
     if (!inRaw) inRaw = { ...pos };
     if (!inSys && score >= 3) inSys = { ...pos };
@@ -984,8 +1071,8 @@ function percentileOf(sorted, v) {
   for (const x of sorted) if (x <= v) c++;
   return Math.round((c / sorted.length) * 100);
 }
-function scanSwings(closes, dates) {
-  const piv = pivots(closes, 4);
+function scanSwings(closes, dates, highs, lows) {
+  const piv = pivots(closes, 4, highs, lows);
   const legs = [];
   for (let k = 1; k < piv.length; k++) {
     const a = piv[k - 1],
@@ -1255,21 +1342,21 @@ function buildPlaybook(m) {
     {
       id: "B",
       dir: "down",
-      title: `Kịch bản B — thủng hỗ trợ ${fx(S)}`,
-      trigger: `Nến D đóng cửa dưới ${fx(S)}`,
+      title: `Kịch bản B — cảnh báo nếu thủng hỗ trợ ${fx(S)} (không mở lệnh bán khống — TTCK VN không hỗ trợ short)`,
+      trigger: `Nến D đóng cửa dưới ${fx(S)} — đây là tín hiệu THOÁT/TRÁNH MUA, không phải điểm vào lệnh`,
       targets: [
-        `T1 = ${fx(tB1)} (0.618 × biên độ S–R)`,
-        `T2 = ${fx(tB2)} (measured move: S − (R−S))`,
+        `Vùng giá có thể về nếu thủng: ${fx(tB1)} (0.618 × biên độ S–R)`,
+        `Vùng mở rộng: ${fx(tB2)} (measured move: S − (R−S))`,
         ...(topScen && topScen.dir === "down" && topScen.target.includes("Fib")
-          ? [`T3 = theo ${topScen.target}`]
+          ? [`Tham chiếu thêm: ${topScen.target}`]
           : []),
         ...(bearPat && bearPat.target
-          ? [`Pattern target = ${fx(bearPat.target)}`]
+          ? [`Pattern chiếu tới: ${fx(bearPat.target)}`]
           : []),
       ],
-      invalid: `Vô hiệu nếu sau khi thủng, giá đóng cửa quay lại trên ${fx(
+      invalid: `Cảnh báo hết hiệu lực nếu giá đóng cửa quay lại trên ${fx(
         S
-      )}; bỏ hẳn khi đóng trên ${fx(R)}`,
+      )}; loại bỏ hẳn khi đóng trên ${fx(R)}`,
       evidence: evBear,
       score: bearScore,
       total: evBear.length,
@@ -1751,30 +1838,60 @@ function rollingMinMaxClose(closes, period) {
   }
   return { hi, lo };
 }
-function closeStochK(closes, period) {
-  const { hi, lo } = rollingMinMaxClose(closes, period);
+// Bản dùng High/Low thật — chuẩn hơn rollingMinMaxClose vì Stochastic/Williams
+// %R/Donchian đúng định nghĩa phải lấy Highest-High và Lowest-Low, không phải
+// lấy từ giá đóng cửa.
+function rollingMinMaxHL(highs, lows, period) {
+  const n = highs.length,
+    hi = Array(n).fill(null),
+    lo = Array(n).fill(null);
+  for (let i = period - 1; i < n; i++) {
+    let hh = -Infinity,
+      ll = Infinity;
+    for (let k = i - period + 1; k <= i; k++) {
+      if (highs[k] > hh) hh = highs[k];
+      if (lows[k] < ll) ll = lows[k];
+    }
+    hi[i] = hh;
+    lo[i] = ll;
+  }
+  return { hi, lo };
+}
+function closeStochK(closes, period, highs, lows) {
+  const { hi, lo } =
+    highs && lows
+      ? rollingMinMaxHL(highs, lows, period)
+      : rollingMinMaxClose(closes, period);
   return closes.map((c, i) =>
     hi[i] != null && hi[i] > lo[i]
       ? ((c - lo[i]) / (hi[i] - lo[i])) * 100
       : null
   );
 }
-function closeWilliamsR(closes, period) {
-  const { hi, lo } = rollingMinMaxClose(closes, period);
+function closeWilliamsR(closes, period, highs, lows) {
+  const { hi, lo } =
+    highs && lows
+      ? rollingMinMaxHL(highs, lows, period)
+      : rollingMinMaxClose(closes, period);
   return closes.map((c, i) =>
     hi[i] != null && hi[i] > lo[i]
       ? ((hi[i] - c) / (hi[i] - lo[i])) * -100
       : null
   );
 }
-function closeCCI(closes, period) {
+// CCI đúng chuẩn dùng giá điển hình (High+Low+Close)/3 khi có H/L thật.
+function closeCCI(closes, period, highs, lows) {
+  const tp =
+    highs && lows
+      ? closes.map((c, i) => (highs[i] + lows[i] + c) / 3)
+      : closes;
   const n = closes.length,
     out = Array(n).fill(null);
   for (let i = period - 1; i < n; i++) {
-    const slice = closes.slice(i - period + 1, i + 1);
+    const slice = tp.slice(i - period + 1, i + 1);
     const m = slice.reduce((a, b) => a + b, 0) / period;
     const md = slice.reduce((a, b) => a + Math.abs(b - m), 0) / period;
-    out[i] = md > 0 ? (closes[i] - m) / (0.015 * md) : 0;
+    out[i] = md > 0 ? (tp[i] - m) / (0.015 * md) : 0;
   }
   return out;
 }
@@ -1798,9 +1915,10 @@ function smaEnvelope(closes, period, pct) {
   };
 }
 
-// buildDefs: 20 chỉ báo TREND + 20 chỉ báo RANGE + 2 chỉ báo VOLUME (mới, thay
-// cho phần forex không có volume). volumes cùng độ dài với closes.
-function buildDefs(closes, volumes) {
+// buildDefs: 20 chỉ báo TREND + 20 chỉ báo RANGE + 2 chỉ báo VOLUME.
+// Khi có highs/lows thật, Stochastic/Williams%R/CCI/Donchian (r15,r16,r17,r18)
+// dùng đúng High/Low trong phiên thay vì xấp xỉ bằng giá đóng cửa.
+function buildDefs(closes, volumes, highs, lows) {
   const ma10 = sma(closes, 10),
     ma50 = sma(closes, 50),
     ma13 = sma(closes, 13),
@@ -1839,10 +1957,13 @@ function buildDefs(closes, volumes) {
   const tsi = tsiCalc(closes, 25, 13),
     dpo = dpoCalc(closes, 20),
     pB = percentB(closes, 20, 2);
-  const csK = closeStochK(closes, 14),
-    cwR = closeWilliamsR(closes, 14),
-    cCCI = closeCCI(closes, 20);
-  const donch = rollingMinMaxClose(closes, 20),
+  const csK = closeStochK(closes, 14, highs, lows),
+    cwR = closeWilliamsR(closes, 14, highs, lows),
+    cCCI = closeCCI(closes, 20, highs, lows);
+  const donch =
+    highs && lows
+      ? rollingMinMaxHL(highs, lows, 20)
+      : rollingMinMaxClose(closes, 20),
     kelt = keltnerFadeClose(closes, 20, 2),
     env = smaEnvelope(closes, 20, 0.02);
 
@@ -2113,7 +2234,7 @@ function buildDefs(closes, volumes) {
     ],
     [
       "r15",
-      "Stochastic %K close(14)",
+      "Stochastic %K H/L(14)",
       (i) =>
         csK[i - 1] != null
           ? csK[i - 1] < 20
@@ -2125,7 +2246,7 @@ function buildDefs(closes, volumes) {
     ],
     [
       "r16",
-      "Williams %R close(14)",
+      "Williams %R H/L(14)",
       (i) =>
         cwR[i - 1] != null
           ? cwR[i - 1] < -80
@@ -2137,7 +2258,7 @@ function buildDefs(closes, volumes) {
     ],
     [
       "r17",
-      "CCI close(20) ±100",
+      "CCI giá điển hình(20) ±100",
       (i) =>
         cCCI[i - 1] != null
           ? cCCI[i - 1] < -100
@@ -2149,7 +2270,7 @@ function buildDefs(closes, volumes) {
     ],
     [
       "r18",
-      "Donchian(20) Fade",
+      "Donchian H/L(20) Fade",
       (i) =>
         donch.hi[i - 1] == null
           ? 0
@@ -2921,13 +3042,14 @@ function runRangeFadeWalkForward(
   };
 }
 
-function buildCMTRegimeSeries(closes) {
+function buildCMTRegimeSeries(closes, highs, lows) {
+  const H_ = highs || closes,
+    L_ = lows || closes;
   const n = closes.length,
     reg = Array(n).fill(0);
   for (let i = 40; i < n; i++) {
-    const w = closes.slice(i - 40, i);
-    const R = Math.max(...w),
-      S = Math.min(...w);
+    const R = Math.max(...H_.slice(i - 40, i)),
+      S = Math.min(...L_.slice(i - 40, i));
     reg[i] = closes[i] > R ? 1 : closes[i] < S ? -1 : 0;
   }
   return reg;
@@ -2941,13 +3063,15 @@ function runProfitViewsWalkForward(
   dates,
   closes,
   atr,
-  opts
+  opts,
+  highs,
+  lows
 ) {
   const folds = Math.max(2, opts.wfFolds);
   const bnd = Array.from({ length: folds + 1 }, (_, k) =>
     Math.floor((n * k) / folds)
   );
-  const cmtReg = buildCMTRegimeSeries(closes);
+  const cmtReg = buildCMTRegimeSeries(closes, highs, lows);
   const sgn = (v) => (v > 0 ? 1 : v < 0 ? -1 : 0);
   const rawTrend = Array(n).fill(0),
     rawRange = Array(n).fill(0);
@@ -2989,6 +3113,8 @@ function runProfitViewsWalkForward(
       relRangeCount: best.relRange.length,
     });
   }
+  // Chỉ Long — TTCK VN không bán khống. Khi regime là "breakdown" (cmtReg<0),
+  // hệ thống đứng ngoài (vị thế = 0) thay vì mở short.
   const tLong = buildPullbackPos(
     rawTrend,
     closes,
@@ -2997,23 +3123,14 @@ function runProfitViewsWalkForward(
     opts.minTrendStrength,
     opts.minPullbackATR
   );
-  const tShort = buildPullbackPos(
-    rawTrend,
-    closes,
-    "short",
-    atr,
-    opts.minTrendStrength,
-    opts.minPullbackATR
-  );
-  const rPos = buildRangeFadePos(rawRange, "side", opts.rangeEnterThr || 0.2);
+  const rPos = buildRangeFadePos(rawRange, "long", opts.rangeEnterThr || 0.2);
   const trendOnly = Array(n).fill(0),
     rangeOnly = Array(n).fill(0),
     combined = Array(n).fill(0);
   for (let i = 0; i < n; i++) {
-    trendOnly[i] = tLong[i] !== 0 ? tLong[i] : tShort[i];
+    trendOnly[i] = tLong[i];
     rangeOnly[i] = rPos[i];
-    combined[i] =
-      cmtReg[i] > 0 ? tLong[i] : cmtReg[i] < 0 ? tShort[i] : rPos[i];
+    combined[i] = cmtReg[i] > 0 ? tLong[i] : cmtReg[i] < 0 ? 0 : rPos[i];
   }
   const oosStart = bnd[1];
   const mk = (pos) => {
@@ -3060,10 +3177,15 @@ function runProfitViewsWalkForward(
   };
 }
 
-function backtestStrategyCards(closes, dates, opts, digits) {
+function backtestStrategyCards(closes, dates, opts, digits, highs, lows) {
+  // Chỉ mua (long) — TTCK VN không bán khống, nên thẻ chiến lược không bao
+  // giờ sinh lệnh short; "side" giữ lại trong dữ liệu trade chỉ để tương
+  // thích với các hàm tính R/priceDiff dùng chung, luôn = 1 (long).
+  const H_ = highs || closes,
+    L_ = lows || closes;
   const n = closes.length;
-  const states = buildStates(closes);
-  const piv = pivots(closes, 4);
+  const states = buildStates(closes, highs, lows);
+  const piv = pivots(closes, 4, highs, lows);
   const trades = [];
   let pos = null,
     pi = 0;
@@ -3078,8 +3200,8 @@ function backtestStrategyCards(closes, dates, opts, digits) {
     }
     const last = closes[i];
     if (pos) {
-      const hitTP = pos.side > 0 ? last >= pos.tp : last <= pos.tp;
-      const hitSL = pos.side > 0 ? last <= pos.stop : last >= pos.stop;
+      const hitTP = last >= pos.tp;
+      const hitSL = last <= pos.stop;
       if (hitTP || hitSL || i - pos.i0 >= maxHold) {
         const exit = hitTP ? pos.tp : hitSL ? pos.stop : last;
         const sl = Math.abs(pos.entry - pos.stop) || 1e-9;
@@ -3087,14 +3209,14 @@ function backtestStrategyCards(closes, dates, opts, digits) {
           entryIdx: pos.i0,
           exitIdx: i,
           finalExitIdx: i,
-          side: pos.side,
+          side: 1,
           entryPrice: pos.entry,
           exitPrice: exit,
           finalExitPrice: exit,
           slDistance: sl,
-          R: (pos.side * (exit - pos.entry)) / sl,
-          ret: (pos.side * (exit - pos.entry)) / pos.entry,
-          priceDiff: pos.side * (exit - pos.entry),
+          R: (exit - pos.entry) / sl,
+          ret: (exit - pos.entry) / pos.entry,
+          priceDiff: exit - pos.entry,
           stoppedOut: hitSL,
           scen: pos.scen,
         });
@@ -3104,13 +3226,14 @@ function backtestStrategyCards(closes, dates, opts, digits) {
     if (pos || i >= n - 2) continue;
     const overhead = H.filter((p) => p.price > last).map((p) => p.price);
     const below = L.filter((p) => p.price < last).map((p) => p.price);
-    const w40 = closes.slice(i - 40, i);
-    const R = overhead.length ? Math.min(...overhead) : Math.max(...w40);
-    const S = below.length ? Math.max(...below) : Math.min(...w40);
+    const w40H = H_.slice(i - 40, i),
+      w40L = L_.slice(i - 40, i);
+    const R = overhead.length ? Math.min(...overhead) : Math.max(...w40H);
+    const S = below.length ? Math.max(...below) : Math.min(...w40L);
     const range = Math.max(R - S, 1e-9);
     const posInRange = (last - S) / range;
-    const R40 = Math.max(...w40),
-      S40 = Math.min(...w40);
+    const R40 = Math.max(...w40H),
+      S40 = Math.min(...w40L);
     const broke = last > R40 || last < S40;
     if (!broke && posInRange < 0.7 && posInRange > 0.3) continue;
     const analog = analogAt(closes, states, i, 20);
@@ -3137,25 +3260,24 @@ function backtestStrategyCards(closes, dates, opts, digits) {
       bias: "side",
       biasPct: 50,
     });
+    // Chỉ mở lệnh khi deriveStrategy cho ra một khuyến nghị MUA hành động
+    // ngay (side "long"); mọi kịch bản giảm/tránh mua đều bị bỏ qua ở đây.
     if (
       st.actionable &&
+      st.side === "long" &&
       st.entryTrigger === "now" &&
       st.stopY != null &&
-      st.tp1Y != null
+      st.tp1Y != null &&
+      st.stopY < last &&
+      st.tp1Y > last
     ) {
-      const side = st.side === "short" ? -1 : 1;
-      const okSides =
-        (side > 0 && st.stopY < last && st.tp1Y > last) ||
-        (side < 0 && st.stopY > last && st.tp1Y < last);
-      if (okSides)
-        pos = {
-          i0: i,
-          side,
-          entry: last,
-          stop: st.stopY,
-          tp: st.tp1Y,
-          scen: st.scen,
-        };
+      pos = {
+        i0: i,
+        entry: last,
+        stop: st.stopY,
+        tp: st.tp1Y,
+        scen: st.scen,
+      };
     }
   }
   const folds = Math.max(2, opts.wfFolds);
@@ -3209,7 +3331,7 @@ function backtestStrategyCards(closes, dates, opts, digits) {
   };
 }
 
-function runHurstAnalysis(closes, volumes, dates, opts, direction, digits) {
+function runHurstAnalysis(closes, volumes, dates, opts, direction, digits, highs, lows) {
   PRICE_UNIT = 1;
   const n = closes.length;
   const bh = Array(n).fill(0),
@@ -3222,8 +3344,12 @@ function runHurstAnalysis(closes, volumes, dates, opts, direction, digits) {
     rollingHurst(rets.slice(1), opts.hurstWin, opts.hurstStep),
     n
   );
-  const atr = closeATR(closes, opts.atrPeriod);
-  const { trendDefs, rangeDefs } = buildDefs(closes, volumes);
+  // ATR thật (H/L/C) khi có dữ liệu; rơi về xấp xỉ close-only nếu thiếu.
+  const atr =
+    highs && lows
+      ? atrTrue(highs, lows, closes, opts.atrPeriod)
+      : closeATR(closes, opts.atrPeriod);
+  const { trendDefs, rangeDefs } = buildDefs(closes, volumes, highs, lows);
   const withInverse = (defs) => [
     ...defs.map(([key, label, fn]) => ({
       key,
@@ -3412,17 +3538,17 @@ function runHurstAnalysis(closes, volumes, dates, opts, direction, digits) {
     closes,
     atr,
     opts,
-    "side"
+    "long"
   );
   const rangeConsLive = buildRangeConsensusSeries(
     liveGated.relRange,
     phase,
     n,
-    "side"
+    "long"
   );
   const rfPosLive = buildRangeFadePos(
     rangeConsLive,
-    "side",
+    "long",
     opts.rangeEnterThr || 0.2
   );
   const rfTradesLive = buildConsensusTradesWithSL(
@@ -3478,9 +3604,18 @@ function runHurstAnalysis(closes, volumes, dates, opts, direction, digits) {
     dates,
     closes,
     atr,
-    opts
+    opts,
+    highs,
+    lows
   );
-  const cardBacktest = backtestStrategyCards(closes, dates, opts, digits);
+  const cardBacktest = backtestStrategyCards(
+    closes,
+    dates,
+    opts,
+    digits,
+    highs,
+    lows
+  );
 
   return {
     dates,
@@ -3583,19 +3718,23 @@ function quickPullbackBacktest(closes, dir, atr, slMult, riskPct) {
       8%  Đồng thuận đa khung W & D
    ============================================================ */
 
-function screenStock(cfg, closes, volumes, dates, opts) {
+function screenStock(cfg, closes, volumes, dates, opts, highs, lows) {
+  const H_ = highs || closes,
+    L_ = lows || closes;
   const n = closes.length;
   const last = closes[n - 1];
   const rsiArr = rsi(closes),
     mac = macd(closes);
   const ma50 = sma(closes, 50),
     ma200 = sma(closes, 200);
-  const pivD = pivots(closes, 4);
+  const pivD = pivots(closes, 4, highs, lows);
   const wk = aggWeekly(closes, dates);
   const mo = aggMonthly(closes, dates);
+  const wkHL = aggWeeklyHL(H_, L_, dates);
+  const moHL = aggMonthlyHL(H_, L_, dates);
   const tD = dowTrend(pivD).trend;
-  const tW = dowTrend(pivots(wk.closes, 2)).trend;
-  const tM = dowTrend(pivots(mo.closes, 2)).trend;
+  const tW = dowTrend(pivots(wk.closes, 2, wkHL.highs, wkHL.lows)).trend;
+  const tM = dowTrend(pivots(mo.closes, 2, moHL.highs, moHL.lows)).trend;
   const consensus = tW === tD && tD !== "side";
 
   const m50 = ma50[n - 1],
@@ -3633,30 +3772,30 @@ function screenStock(cfg, closes, volumes, dates, opts) {
     .map((p) => p.price);
   const R = overhead.length
     ? Math.min(...overhead)
-    : Math.max(...closes.slice(-40));
-  const S = below.length ? Math.max(...below) : Math.min(...closes.slice(-40));
+    : Math.max(...H_.slice(-40));
+  const S = below.length ? Math.max(...below) : Math.min(...L_.slice(-40));
   const range = Math.max(R - S, 1e-9);
 
-  const w40 = closes.slice(-41, -1);
-  const R40 = Math.max(...w40),
-    S40 = Math.min(...w40);
+  const w40H = H_.slice(-41, -1),
+    w40L = L_.slice(-41, -1);
+  const R40 = Math.max(...w40H),
+    S40 = Math.min(...w40L);
   let state = "IN_RANGE";
   if (last > R40) state = "RUN_UP";
   else if (last < S40) state = "RUN_DOWN";
   else if (Math.min(R - last, last - S) / range < 0.15) state = "NEAR_TRIGGER";
 
-  const analog = analogProbabilities(closes, buildStates(closes));
-  const rule = scanBreakoutRule(closes);
+  const analog = analogProbabilities(closes, buildStates(closes, highs, lows));
+  const rule = scanBreakoutRule(closes, highs, lows);
   const H = quickHurst(returns(closes).map((r) => Math.log(1 + r)));
-  const atr = closeATR(closes, opts.atrPeriod);
+  const atr =
+    highs && lows
+      ? atrTrue(highs, lows, closes, opts.atrPeriod)
+      : closeATR(closes, opts.atrPeriod);
   const volPct = ((atr[n - 1] ?? 0) / last) * 100;
-  const qb = quickPullbackBacktest(
-    closes,
-    bias === "down" ? "short" : "long",
-    atr,
-    opts.slMult,
-    opts.riskPct
-  );
+  // Kiểm tra chất lượng "mua theo hồi xu hướng" trên chính mã này — luôn
+  // theo chiều LONG vì TTCK VN không bán khống, bất kể bias hiện tại là gì.
+  const qb = quickPullbackBacktest(closes, "long", atr, opts.slMult, opts.riskPct);
 
   const prob = analog
     ? bias === "up"
@@ -3736,32 +3875,17 @@ function deriveStrategy(row) {
   st.tp1Y = st.tps && st.tps[0] ? st.tps[0].y : null;
   st.tp2Y = st.tps && st.tps[1] ? st.tps[1].y : null;
   st.entryY = row.price;
-  if (st.scen === "reject-R") {
+  // TTCK VN không có bán khống — chỉ set điểm vào lệnh cho kịch bản MUA.
+  if (st.side !== "long") return st;
+  if (st.scen === "reject-S") {
     st.actionable = true;
     st.entryTrigger = "now";
-    st.side = "short";
-    st.stopY = R + buf;
-  } else if (st.scen === "reject-S") {
-    st.actionable = true;
-    st.entryTrigger = "now";
-    st.side = "long";
     st.stopY = S - buf;
   } else if (st.scen === "A" && state === "RUN_UP") {
     st.actionable = true;
     st.entryTrigger = "now";
-    st.side = "long";
     st.stopY = R - buf;
-  } else if (st.scen === "B" && state === "RUN_DOWN") {
-    st.actionable = true;
-    st.entryTrigger = "now";
-    st.side = "short";
-    st.stopY = S + buf;
-  } else if (
-    st.dir === "long-breakout" ||
-    st.dir === "short-breakout" ||
-    st.scen === "false-A" ||
-    st.scen === "false-B"
-  ) {
+  } else if (st.dir === "long-breakout" || st.scen === "false-B") {
     st.entryTrigger = "break";
   }
   return st;
@@ -3781,6 +3905,7 @@ function deriveStrategyCore(row) {
       stop: null,
       tps: [],
       scen: null,
+      side: "none",
     };
   const { pA, pB, pC, n } = analog;
   const posInRange = Math.max(0, Math.min(1, (price - S) / range));
@@ -3804,8 +3929,8 @@ function deriveStrategyCore(row) {
 
   const tpDown = (safe) =>
     safe
-      ? { lbl: "TP1 (an toàn) = biên dưới S", y: S }
-      : { lbl: "TP2 (mở rộng) = target B", y: S - 0.618 * range };
+      ? { lbl: "Vùng cần chú ý (an toàn) = biên dưới S", y: S }
+      : { lbl: "Vùng cần chú ý (mở rộng) = target B", y: S - 0.618 * range };
   const tpUp = (safe) =>
     safe
       ? { lbl: "TP1 (an toàn) = biên trên R", y: R }
@@ -3830,45 +3955,45 @@ function deriveStrategyCore(row) {
         side: "long",
       };
     return {
-      dir: "caution",
+      dir: "avoid",
       conf: "thấp",
-      title: "Phá lên nhưng xác suất A thấp — cảnh giác false break",
-      why: `Giá phá lên nhưng A chỉ ${pA}% trong khi kịch bản khác cao hơn — rủi ro bull-trap. Chỉ short khi giá ĐÓNG LẠI dưới ${fx(
+      title: "Phá lên nhưng xác suất A thấp — tránh mua đuổi",
+      why: `Giá phá lên nhưng A chỉ ${pA}% trong khi kịch bản khác cao hơn — rủi ro bull-trap. TTCK VN không bán khống nên không có lệnh cho kịch bản này; nếu đang cầm hàng, cân nhắc chốt lời khi giá còn trên ${fx(
         R
-      )}.`,
-      entry: `Chỉ hành động khi đóng lại dưới ${fx(R)} → short`,
-      stop: `Trên đỉnh vừa tạo`,
+      )}, và thoát nếu đóng cửa quay lại dưới ${fx(R)}.`,
+      entry: null,
+      stop: `Nếu đang giữ: cân nhắc thoát khi đóng lại dưới ${fx(R)}`,
       tps: [tpDown(true), { lbl: "về giữa biên", y: mid }],
       scen: "false-A",
-      side: "short",
+      side: "avoid",
     };
   }
   if (state === "RUN_DOWN") {
     if (top === "B" || pB >= 40)
       return {
-        dir: "short",
+        dir: "avoid",
         conf: confOf(tfDown >= 2),
-        title: "Tiếp diễn phá xuống — bán khi giá hồi",
-        why: `Giá đã đóng dưới biên và B (phá xuống) vẫn cao (${pB}%). Chờ hồi lên retest ~${fx(
+        title: "Tiếp diễn phá xuống — đứng ngoài, không mua",
+        why: `Giá đã đóng dưới biên và B (phá xuống) vẫn cao (${pB}%). TTCK VN không bán khống nên không có lệnh cho kịch bản này. Nếu đang cầm hàng, đây là vùng rủi ro — cân nhắc cắt lỗ hoặc chờ hồi lên retest ~${fx(
           S
-        )} rồi bán tiếp.`,
-        entry: `Chờ hồi lên retest ~${fx(S)} có nến từ chối tăng`,
-        stop: `Đóng lại trên ${fx(S)}`,
+        )} để thoát bớt.`,
+        entry: null,
+        stop: `Nếu đang giữ: cân nhắc cắt lỗ nếu chưa đóng lại trên ${fx(S)}`,
         tps: [
-          { lbl: "T1 = S − 0.618×biên", y: S - 0.618 * range },
-          { lbl: "T2 = S − biên (measured)", y: S - range },
+          { lbl: "Vùng cần chú ý T1 = S − 0.618×biên", y: S - 0.618 * range },
+          { lbl: "Vùng cần chú ý T2 = S − biên (measured)", y: S - range },
         ],
         scen: "B",
-        side: "short",
+        side: "avoid",
       };
     return {
       dir: "caution",
       conf: "thấp",
       title: "Phá xuống nhưng xác suất B thấp — cảnh giác bear-trap",
-      why: `Giá phá xuống nhưng B chỉ ${pB}% — rủi ro bẫy giảm. Chỉ long khi đóng lại trên ${fx(
+      why: `Giá phá xuống nhưng B chỉ ${pB}% — rủi ro bẫy giảm, dễ bật lại. Chờ đóng cửa quay lại trên ${fx(
         S
-      )}.`,
-      entry: `Chỉ hành động khi đóng lại trên ${fx(S)} → long`,
+      )} mới mua — không mua khi còn dưới biên.`,
+      entry: `Chỉ mua khi đóng cửa quay lại trên ${fx(S)}`,
       stop: `Dưới đáy vừa tạo`,
       tps: [tpUp(true), { lbl: "về giữa biên", y: mid }],
       scen: "false-B",
@@ -3892,39 +4017,41 @@ function deriveStrategyCore(row) {
         side: "long",
       };
     return {
-      dir: "short",
+      dir: "avoid",
       conf: confOf(tfDown >= 1),
-      title: "Fade kháng cự — SHORT (phá lên xác suất thấp)",
+      title: "Tại kháng cự — tránh mua đuổi (không có lệnh short)",
       why: `Giá chạm kháng cự ${fx(
         R
-      )}. A chỉ ${pA}% — thấp; B ${pB}% và C ${pC}% đều cao hơn. Nhiều khả năng bị từ chối và quay xuống → SHORT tại kháng cự.`,
-      entry: `Short quanh ${fx(
-        R
-      )} khi có nến từ chối tăng / RSI quay xuống từ >70`,
-      stop: `Đóng cửa trên ${fx(R)} (A kích hoạt → sai kèo, thoát)`,
+      )}. A chỉ ${pA}% — thấp; B ${pB}% và C ${pC}% đều cao hơn, nhiều khả năng bị từ chối và quay xuống. TTCK VN không bán khống nên không mở lệnh mới ở đây — chờ giá hồi về hỗ trợ ${fx(
+        S
+      )} để mua, hoặc chờ break xác nhận qua ${fx(R)}.`,
+      entry: null,
+      stop: null,
       tps: [
         tpDown(true),
         pB >= 35 ? tpDown(false) : { lbl: "về giữa biên (C)", y: mid },
       ],
       scen: "reject-R",
-      side: "short",
+      side: "avoid",
     };
   }
 
   if (nearS) {
     if (top === "B" && pB >= 45)
       return {
-        dir: "short-breakout",
+        dir: "avoid",
         conf: confOf(tfDown >= 2),
-        title: "Chờ phá xuống hỗ trợ — bán khi break xác nhận",
+        title: "Tại hỗ trợ nhưng nghiêng thủng — chờ, chưa mua",
         why: `Giá ở hỗ trợ ${fx(
           S
-        )} và B (phá xuống) cao nhất (${pB}%). Chờ đóng dưới S rồi bán.`,
-        entry: `Bán khi đóng dưới ${fx(S)}`,
-        stop: `Trên ${fx(S)} sau khi thủng`,
+        )} nhưng B (phá xuống) cao nhất (${pB}%) — rủi ro thủng hỗ trợ. Chờ giá ổn định hoặc đóng cửa giữ vững trên ${fx(
+          S
+        )} rồi mới mua; nếu đang giữ, đây là vùng cần theo dõi sát để cắt lỗ nếu thủng.`,
+        entry: null,
+        stop: `Nếu đang giữ: cắt lỗ nếu đóng cửa dưới ${fx(S)}`,
         tps: [tpDown(true), tpDown(false)],
         scen: "B",
-        side: "short",
+        side: "avoid",
       };
     return {
       dir: "long",
@@ -3951,39 +4078,39 @@ function deriveStrategyCore(row) {
       dir: "wait",
       conf: "trung bình",
       title: "Giữa biên, C (đi ngang) cao — chờ giá tới mép",
-      why: `Giá đang ở giữa biên và C (giữ biên ${pC}%) là kịch bản cao nhất. Chờ giá chạm ${fx(
-        R
-      )} (để short) hoặc ${fx(S)} (để long).`,
+      why: `Giá đang ở giữa biên và C (giữ biên ${pC}%) là kịch bản cao nhất. Đặt cảnh báo tại ${fx(
+        S
+      )} (để mua) và ${fx(R)} (để chốt lời nếu đang giữ / tránh mua đuổi).`,
       entry: `Đặt cảnh báo tại ${fx(R)} và ${fx(S)}`,
       stop: null,
       tps: [
-        { lbl: "Biên trên R", y: R },
-        { lbl: "Biên dưới S", y: S },
+        { lbl: "Biên trên R (chốt lời/tránh mua đuổi)", y: R },
+        { lbl: "Biên dưới S (vùng mua)", y: S },
       ],
       scen: "C",
       side: "none",
     };
   const dirUp = top === "A";
   return {
-    dir: "wait",
+    dir: dirUp ? "wait" : "avoid",
     conf: "trung bình",
-    title: `Giữa biên — nghiêng ${
-      dirUp ? "phá lên (A)" : "phá xuống (B)"
-    }, chờ điểm vào`,
-    why: `Giữa biên nhưng ${dirUp ? "A" : "B"} trội (${
-      dirUp ? pA : pB
-    }%). Chờ giá về ${
-      dirUp
-        ? "hỗ trợ " + fx(S) + " để long theo A"
-        : "kháng cự " + fx(R) + " để short theo B"
-    }, hoặc chờ break xác nhận.`,
+    title: dirUp
+      ? "Giữa biên — nghiêng phá lên (A), chờ điểm vào"
+      : "Giữa biên — nghiêng phá xuống (B), chưa mua",
+    why: dirUp
+      ? `Giữa biên nhưng A trội (${pA}%). Chờ giá về hỗ trợ ${fx(
+          S
+        )} để mua theo A, hoặc chờ break xác nhận qua ${fx(R)}.`
+      : `Giữa biên nhưng B trội (${pB}%) — nghiêng giảm. TTCK VN không bán khống nên không có lệnh cho kịch bản này; chờ giá về gần hỗ trợ ${fx(
+          S
+        )} và ổn định trở lại rồi mới cân nhắc mua.`,
     entry: dirUp
-      ? `Chờ hồi về ${fx(S)} rồi long, hoặc mua break trên ${fx(R)}`
-      : `Chờ hồi lên ${fx(R)} rồi short, hoặc bán break dưới ${fx(S)}`,
+      ? `Chờ hồi về ${fx(S)} rồi mua, hoặc mua break trên ${fx(R)}`
+      : null,
     stop: null,
     tps: dirUp ? [tpUp(true), tpUp(false)] : [tpDown(true), tpDown(false)],
     scen: dirUp ? "A" : "B",
-    side: dirUp ? "long" : "short",
+    side: dirUp ? "long" : "avoid",
   };
 }
 
@@ -4210,10 +4337,9 @@ const STATE_LABEL = {
   IN_RANGE: { t: "Trong biên", c: "mut" },
 };
 const DIR_META = {
-  short: { t: "SHORT", c: CLR.bear },
   long: { t: "LONG", c: CLR.bull },
-  "short-breakout": { t: "SHORT (chờ break)", c: CLR.bear },
   "long-breakout": { t: "LONG (chờ break)", c: CLR.bull },
+  avoid: { t: "TRÁNH MUA", c: CLR.bear },
   caution: { t: "CẢNH GIÁC", c: CLR.amber },
   wait: { t: "CHỜ", c: CLR.mut },
 };
@@ -5011,7 +5137,7 @@ function ScreenerSection({ rows, openStock }) {
                           r.strategy &&
                           (r.strategy.side === "long"
                             ? "rgba(63,214,164,.5)"
-                            : r.strategy.side === "short"
+                            : r.strategy.side === "avoid"
                             ? "rgba(238,106,95,.5)"
                             : CLR.line),
                       }}
@@ -5037,9 +5163,11 @@ function ScreenerSection({ rows, openStock }) {
         </p>
       </Panel>
       <Warn>
-        Dữ liệu là giá đóng cửa & khối lượng khớp lệnh thật từ vnstock (nguồn
-        KBS), không phải toàn bộ thị trường mà chỉ rổ VN30 để backend không quá
-        tải. Chưa tính phí giao dịch/thuế.
+        Dữ liệu là giá đóng cửa, High/Low & khối lượng khớp lệnh thật từ
+        vnstock (nguồn KBS), không phải toàn bộ thị trường mà chỉ rổ VN30 để
+        backend không quá tải. Chưa tính phí giao dịch/thuế. Toàn bộ khuyến
+        nghị trong app chỉ áp dụng cho lệnh MUA — TTCK VN hiện không cho phép
+        bán khống (short) với nhà đầu tư cá nhân.
       </Warn>
       {stratRow && (
         <StrategyModal
@@ -5649,23 +5777,25 @@ function ConfirmLayer({
    11. CMT — LỚP 4: RỦI RO & TƯƠNG QUAN
    ============================================================ */
 
-function RiskLayer({ allCloses, matrixKeys, vol, cfg, digits, lastPrice }) {
+function RiskLayer({ allCloses, matrixKeys, vol, volIsTrueATR, cfg, digits, lastPrice }) {
   const [equity, setEquity] = useState(100000000);
   const [riskPct, setRiskPct] = useState(1);
   const [volMult, setVolMult] = useState(2);
-  const [positions, setPositions] = useState([{ key: cfg.key, dir: "Long" }]);
+  const [positions, setPositions] = useState([cfg.key]);
   const rets = {};
   matrixKeys.forEach((k) => (rets[k] = returns(allCloses[k] || []).slice(-60)));
   const mat = matrixKeys.map((a) =>
     matrixKeys.map((b) => pearson(rets[a] || [], rets[b] || []))
   );
+  // Toàn bộ vị thế đều là MUA (TTCK VN không bán khống), nên "double risk"
+  // ở đây chỉ còn một dạng: hai mã cùng đang mua mà tương quan quá cao —
+  // thực chất là đặt cược hai lần vào cùng một yếu tố (ngành, VNINDEX...).
   const dbl = [];
-  positions.forEach((p1, i) =>
-    positions.slice(i + 1).forEach((p2) => {
-      if (!rets[p1.key] || !rets[p2.key]) return;
-      const c = pearson(rets[p1.key], rets[p2.key]);
-      if ((c > 0.7 && p1.dir === p2.dir) || (c < -0.7 && p1.dir !== p2.dir))
-        dbl.push({ a: p1, b: p2, c });
+  positions.forEach((a, i) =>
+    positions.slice(i + 1).forEach((b) => {
+      if (!rets[a] || !rets[b]) return;
+      const c = pearson(rets[a], rets[b]);
+      if (c > 0.7) dbl.push({ a, b, c });
     })
   );
   const stopDist = vol * volMult;
@@ -5678,23 +5808,17 @@ function RiskLayer({ allCloses, matrixKeys, vol, cfg, digits, lastPrice }) {
       ? `rgba(63,214,164,${0.08 + Math.abs(v) * 0.3})`
       : `rgba(238,106,95,${0.08 + Math.abs(v) * 0.3})`;
   const toggle = (k) =>
-    setPositions((c) =>
-      c.find((x) => x.key === k)
-        ? c.filter((x) => x.key !== k)
-        : [...c, { key: k, dir: "Long" }]
-    );
-  const flip = (k) =>
-    setPositions((c) =>
-      c.map((x) =>
-        x.key === k ? { ...x, dir: x.dir === "Long" ? "Short" : "Long" } : x
-      )
-    );
+    setPositions((c) => (c.includes(k) ? c.filter((x) => x !== k) : [...c, k]));
   return (
     <>
       <Panel
         mod="Module 4 · Position sizing"
         title={`Khối lượng theo biến động — ${cfg.label}`}
-        sub="Không sizing cố định — khối lượng co giãn theo biến động để rủi ro mỗi lệnh là hằng số. Vol dùng EMA(14) của |Δ giá đóng cửa|."
+        sub={
+          volIsTrueATR
+            ? "Không sizing cố định — khối lượng co giãn theo biến động để rủi ro mỗi lệnh là hằng số. Vol dùng ATR(14) thật (Wilder, tính từ High/Low/Close)."
+            : "Không sizing cố định — khối lượng co giãn theo biến động để rủi ro mỗi lệnh là hằng số. Vol dùng EMA(14) của |Δ giá đóng cửa| (chưa có High/Low)."
+        }
       >
         <div className="grid3">
           <div>
@@ -5729,7 +5853,7 @@ function RiskLayer({ allCloses, matrixKeys, vol, cfg, digits, lastPrice }) {
         </div>
         <div style={{ marginTop: 12 }}>
           <div className="kv">
-            <span>Vol-proxy(14) khung D</span>
+            <span>{volIsTrueATR ? "ATR thật(14) khung D" : "Vol-proxy(14) khung D"}</span>
             <span className="num">{fmtMoney(vol)}</span>
           </div>
           <div className="kv">
@@ -5752,7 +5876,7 @@ function RiskLayer({ allCloses, matrixKeys, vol, cfg, digits, lastPrice }) {
         <Panel
           mod="Module 4 · Tương quan"
           title="Ma trận tương quan giữa các mã VN30"
-          sub="Cảnh báo khi hai lệnh thực chất là một cược (cùng ngành, cùng nhóm dẫn dắt bởi VNINDEX)."
+          sub="Cảnh báo khi hai lệnh mua thực chất là một cược (cùng ngành, cùng nhóm dẫn dắt bởi VNINDEX)."
         >
           <div style={{ overflowX: "auto" }}>
             <table className="tbl">
@@ -5792,61 +5916,42 @@ function RiskLayer({ allCloses, matrixKeys, vol, cfg, digits, lastPrice }) {
           {dbl.map((d, i) => (
             <div key={i} style={{ marginTop: 10 }}>
               <Chip cls="down">
-                Double risk: {d.a.dir} {d.a.key} + {d.b.dir} {d.b.key} (corr{" "}
-                {d.c.toFixed(2)}) — thực chất là một cược nhân đôi
+                Double risk: Mua {d.a} + Mua {d.b} (corr {d.c.toFixed(2)}) —
+                thực chất là một cược nhân đôi
               </Chip>
             </div>
           ))}
           {dbl.length === 0 && (
             <div style={{ marginTop: 10 }}>
               <Chip cls="up">
-                Không có cặp lệnh trùng cược trên ngưỡng |0.70|
+                Không có cặp mã trùng cược trên ngưỡng tương quan 0.70
               </Chip>
             </div>
           )}
         </Panel>
         <Panel
           mod="Module 4 · Danh mục giả định"
-          title="Chọn vị thế để kiểm tra rủi ro chéo"
-          sub="Bật/tắt mã và đảo hướng để mô phỏng danh mục — kiểm tra double risk trên tương quan thật."
+          title="Chọn vị thế MUA để kiểm tra rủi ro chéo"
+          sub="Bật/tắt mã để mô phỏng danh mục đang nắm giữ — kiểm tra double risk trên tương quan thật. TTCK VN chỉ có chiều mua nên không có lựa chọn hướng."
         >
           <table className="tbl">
             <thead>
               <tr>
                 <th>Mã</th>
-                <th>Trong danh mục</th>
-                <th>Hướng</th>
+                <th>Trong danh mục (đang mua)</th>
               </tr>
             </thead>
             <tbody>
-              {matrixKeys.map((k) => {
-                const pos = positions.find((x) => x.key === k);
-                return (
-                  <tr key={k}>
-                    <td>{k}</td>
-                    <td>
-                      <button className="bt" onClick={() => toggle(k)}>
-                        {pos ? "Bỏ" : "Thêm"}
-                      </button>
-                    </td>
-                    <td>
-                      {pos ? (
-                        <button className="bt" onClick={() => flip(k)}>
-                          <span
-                            style={{
-                              color: pos.dir === "Long" ? CLR.bull : CLR.bear,
-                            }}
-                          >
-                            {pos.dir}
-                          </span>
-                        </button>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
+              {matrixKeys.map((k) => (
+                <tr key={k}>
+                  <td>{k}</td>
+                  <td>
+                    <button className="bt" onClick={() => toggle(k)}>
+                      {positions.includes(k) ? "Đang mua — bỏ" : "Thêm vào danh mục"}
+                    </button>
+                  </td>
+                </tr>
+              ))}
             </tbody>
           </table>
           <p className="sub" style={{ marginTop: 10 }}>
@@ -6830,7 +6935,7 @@ function SummaryLayer({ cfg, model, hist, digits, goLayer, goHurst }) {
           <>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
               <Chip cls={gate.dir === "long" ? "up" : "down"}>
-                ● CMT: BREAKOUT {gate.dir === "long" ? "LONG" : "SHORT"}
+                ● CMT: BREAKOUT {gate.dir === "long" ? "LÊN — LONG" : "XUỐNG — CẢNH BÁO (không short)"}
               </Chip>
               <Chip cls="mut">
                 Phá {gate.dir === "long" ? "lên trên" : "xuống dưới"}{" "}
@@ -6849,7 +6954,9 @@ function SummaryLayer({ cfg, model, hist, digits, goLayer, goHurst }) {
               style={{ borderColor: gate.dir === "long" ? CLR.bull : CLR.bear, color: CLR.text, fontWeight: 700 }}
               onClick={goHurst}
             >
-              ⚡ Đối chiếu với Hurst (Trend) →
+              {gate.dir === "long"
+                ? "⚡ Đối chiếu với Hurst (Trend) →"
+                : "⚡ Xem Hurst — tham khảo rủi ro nếu đang giữ →"}
             </button>
           </>
         ) : (
@@ -6969,7 +7076,9 @@ function computeConfirm(d, cmtRegime, cmtDir) {
   if (phase === cmtRegime) regimeMatch = "match";
   else if (phase === "OTHER") regimeMatch = "unclear";
   else regimeMatch = "conflict";
-  const netDir = familyNet > 0.05 ? "long" : familyNet < -0.05 ? "short" : "flat";
+  // netDir "down" là NGHIÊNG GIẢM của chỉ báo (thông tin tham khảo/cảnh báo),
+  // không phải một lệnh short — TTCK VN không bán khống.
+  const netDir = familyNet > 0.05 ? "long" : familyNet < -0.05 ? "down" : "flat";
   const dirMatch =
     cmtDir === "side"
       ? netDir !== "flat"
@@ -6983,7 +7092,7 @@ function computeConfirm(d, cmtRegime, cmtDir) {
   let verdict, vcls;
   if (regimeMatch === "match" && dirMatch === "match") {
     verdict = "Hurst XÁC NHẬN CMT";
-    vcls = cmtDir === "long" ? "up" : cmtDir === "short" ? "down" : "side";
+    vcls = cmtDir === "long" ? "up" : cmtDir === "down" ? "down" : "side";
   } else if (regimeMatch === "conflict") {
     verdict = "Hurst MÂU THUẪN về regime";
     vcls = "down";
@@ -6991,7 +7100,7 @@ function computeConfirm(d, cmtRegime, cmtDir) {
     verdict = "Hurst đồng ý regime nhưng NGƯỢC hướng";
     vcls = "side";
   } else if (regimeMatch === "match" && dirMatch === "lean") {
-    verdict = `Hurst đồng ý regime · chỉ báo nghiêng ${netDir === "long" ? "Long" : "Short"}`;
+    verdict = `Hurst đồng ý regime · chỉ báo nghiêng ${netDir === "long" ? "Tăng" : "Giảm"}`;
     vcls = netDir === "long" ? "up" : "down";
   } else if (regimeMatch === "match") {
     verdict = "Hurst đồng ý regime, hướng chưa rõ";
@@ -7005,16 +7114,16 @@ function computeConfirm(d, cmtRegime, cmtDir) {
 
 const REGIME_STRAT = {
   TREND: {
-    name: "Pullback theo Trend",
-    desc: "Vào khi có xu hướng + phiên giá lùi ngược; bám 22 chỉ báo Trend (kể cả 2 chỉ báo volume) theo đúng hướng Long/Short của CMT.",
+    name: "Pullback theo Trend (Long)",
+    desc: "Chỉ mua khi có xu hướng tăng + phiên giá lùi ngược (không mở lệnh khi xu hướng giảm — TTCK VN không bán khống); bám 22 chỉ báo Trend (kể cả 2 chỉ báo volume).",
   },
   RANGE: {
-    name: "Oscillator Fade 2 chiều",
-    desc: "Fade cả hai đầu biên khi đồng thuận oscillator chạm cực trị; bám 20 chỉ báo Oscillator.",
+    name: "Mua đáy biên (Long-only)",
+    desc: "Chỉ mua khi đồng thuận oscillator chạm cực trị đáy biên; KHÔNG bán khống ở đỉnh biên — tại đỉnh biên chỉ dùng làm tín hiệu chốt lời nếu đang giữ. Bám 20 chỉ báo Oscillator.",
   },
 };
 
-function HurstTab({ cfg, dir, dirChoice, setDirChoice, opts, setOpts, detail, capital, riskPctIn, gate }) {
+function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate }) {
   const [profitView, setProfitView] = React.useState("combined");
   if (!detail)
     return (
@@ -7037,7 +7146,7 @@ function HurstTab({ cfg, dir, dirChoice, setDirChoice, opts, setOpts, detail, ca
       <Panel
         mod="Đối chiếu · CMT ↔ Hurst"
         title={`CMT nói ${
-          cmtRegime === "TREND" ? `BREAKOUT ${cmtDir === "long" ? "LONG" : "SHORT"}` : "ĐANG TRONG BIÊN"
+          cmtRegime === "TREND" ? `BREAKOUT ${cmtDir === "long" ? "LÊN (LONG)" : "XUỐNG (CẢNH BÁO — không short)"}` : "ĐANG TRONG BIÊN"
         } — Hurst có đồng ý không?`}
         sub="Hurst kiểm tra chính trạng thái CMT đưa ra: regime có khớp không (phase Hurst + hệ số H), và họ chỉ báo tương ứng (kể cả 2 chỉ báo volume) nghiêng hướng nào."
       >
@@ -7058,9 +7167,9 @@ function HurstTab({ cfg, dir, dirChoice, setDirChoice, opts, setOpts, detail, ca
               <span>Hướng</span>
               <span
                 className="num"
-                style={{ color: cmtDir === "long" ? CLR.bull : cmtDir === "short" ? CLR.bear : CLR.amber }}
+                style={{ color: cmtDir === "long" ? CLR.bull : cmtDir === "down" ? CLR.bear : CLR.amber }}
               >
-                {cmtDir === "long" ? "Long" : cmtDir === "short" ? "Short" : "Trung tính"}
+                {cmtDir === "long" ? "Long" : cmtDir === "down" ? "Giảm (không có lệnh)" : "Trung tính"}
               </span>
             </div>
             <div className="kv" style={{ border: "none" }}>
@@ -7102,7 +7211,7 @@ function HurstTab({ cfg, dir, dirChoice, setDirChoice, opts, setOpts, detail, ca
             <div className="kv">
               <span>Net đồng thuận</span>
               <span className="num" style={{ color: conf.familyNet > 0 ? CLR.bull : conf.familyNet < 0 ? CLR.bear : CLR.mut }}>
-                {netPct(conf.familyNet)} ({conf.netDir === "long" ? "Long" : conf.netDir === "short" ? "Short" : "phẳng"})
+                {netPct(conf.familyNet)} ({conf.netDir === "long" ? "Long" : conf.netDir === "down" ? "Giảm" : "phẳng"})
               </span>
             </div>
             <div className="kv">
@@ -7124,7 +7233,7 @@ function HurstTab({ cfg, dir, dirChoice, setDirChoice, opts, setOpts, detail, ca
       <Panel
         mod="Hurst · Tham số mô phỏng"
         title="Vốn & rủi ro của bạn"
-        sub="Áp cho backtest và mô phỏng tài khoản. Hướng khoá theo CMT; nút Long/Short chỉ dùng khi cố ý kiểm tra chiều ngược."
+        sub="Áp cho backtest và mô phỏng tài khoản. TTCK VN không có bán khống nên toàn bộ hệ thống chỉ mở lệnh Mua (Long) — khi CMT báo breakdown, hệ thống đứng ngoài thay vì mở lệnh ngược."
       >
         <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-end" }}>
           <div>
@@ -7189,18 +7298,22 @@ function HurstTab({ cfg, dir, dirChoice, setDirChoice, opts, setOpts, detail, ca
             />
           </div>
           <div>
-            <label className="lb">Hướng (khoá theo CMT)</label>
-            <div style={{ display: "flex", gap: 6 }}>
-              {["auto", "long", "short"].map((m) => (
-                <button
-                  key={m}
-                  className="bt"
-                  onClick={() => setDirChoice(m)}
-                  style={dirChoice === m ? { borderColor: CLR.blue, color: CLR.text } : {}}
-                >
-                  {m === "auto" ? `Theo CMT (${dir === "long" ? "L" : "S"})` : m === "long" ? "Long" : "Short"}
-                </button>
-              ))}
+            <label className="lb">Hướng giao dịch</label>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                height: 33,
+                padding: "0 10px",
+                border: `1px solid ${CLR.line}`,
+                borderRadius: 8,
+                color: CLR.bull,
+                fontWeight: 700,
+                fontSize: 13,
+              }}
+              title="TTCK VN không hỗ trợ bán khống — toàn bộ hệ thống chỉ tính lệnh Mua (Long)"
+            >
+              Chỉ Long
             </div>
           </div>
         </div>
@@ -7386,10 +7499,9 @@ function HurstTab({ cfg, dir, dirChoice, setDirChoice, opts, setOpts, detail, ca
           wl = cb.winLoss;
         const moneyEq = cb.equity.map((e) => ({ d: e.d, v: capital.value * (1 + e.cum / 100) }));
         const scenName = {
-          "reject-R": "Fade kháng cự (short)",
-          "reject-S": "Fade hỗ trợ (long)",
-          A: "Tiếp diễn phá lên",
-          B: "Tiếp diễn phá xuống",
+          "reject-S": "Mua tại hỗ trợ (fade)",
+          A: "Mua theo tiếp diễn phá lên",
+          "false-B": "Mua khi bear-trap đảo chiều",
         };
         const scenRows = Object.entries(cb.byScen).sort((a, b) => b[1].n - a[1].n);
         return (
@@ -7524,12 +7636,16 @@ function HurstTab({ cfg, dir, dirChoice, setDirChoice, opts, setOpts, detail, ca
    16. TRÌNH CMT (7 bước) — bọc quanh 1 mã
    ============================================================ */
 
-function buildCMTModel(closes, volumes, dates, cfg) {
+function buildCMTModel(closes, volumes, dates, cfg, highs, lows) {
+  const H_ = highs || closes,
+    L_ = lows || closes;
   const wk = aggWeekly(closes, dates);
   const mo = aggMonthly(closes, dates);
-  const pivD = pivots(closes, 4);
-  const pivW = pivots(wk.closes, 2);
-  const pivM = pivots(mo.closes, 2);
+  const wkHL = aggWeeklyHL(H_, L_, dates);
+  const moHL = aggMonthlyHL(H_, L_, dates);
+  const pivD = pivots(closes, 4, highs, lows);
+  const pivW = pivots(wk.closes, 2, wkHL.highs, wkHL.lows);
+  const pivM = pivots(mo.closes, 2, moHL.highs, moHL.lows);
   const dW = dowTrend(pivW),
     dD = dowTrend(pivD),
     dM = dowTrend(pivM);
@@ -7540,14 +7656,16 @@ function buildCMTModel(closes, volumes, dates, cfg) {
     consensus: dW.trend === dD.trend && dD.trend !== "side",
     fullAlign: dM.trend === dW.trend && dW.trend === dD.trend && dD.trend !== "side",
   };
-  const cascade = stepDownCascade(closes, dates);
+  const cascade = stepDownCascade(closes, dates, highs, lows);
 
   const vp = volProxy(closes);
   const av = vp[vp.length - 1];
   const winN = Math.min(160, closes.length);
   const winCloses = closes.slice(-winN),
     winDates = dates.slice(-winN);
-  const pivWin = pivots(winCloses, 4);
+  const winHighs = H_.slice(-winN),
+    winLows = L_.slice(-winN);
+  const pivWin = pivots(winCloses, 4, winHighs, winLows);
   const patterns = detectPatterns(winCloses, pivWin, av * 3, cfg.digits);
   const scens = elliottScenarios(pivWin, cfg.digits);
 
@@ -7583,10 +7701,14 @@ function buildCMTModel(closes, volumes, dates, cfg) {
   });
 
   const lastC = closes[closes.length - 1];
-  const w40 = closes.slice(-41, -1);
-  const R40 = Math.max(...w40),
-    S40 = Math.min(...w40);
+  const w40H = H_.slice(-41, -1),
+    w40L = L_.slice(-41, -1);
+  const R40 = Math.max(...w40H),
+    S40 = Math.min(...w40L);
   const band40 = Math.max(R40 - S40, 1e-9);
+  // TTCK VN không bán khống — tradeGate.dir chỉ có "long" (breakout lên, có
+  // thể mua) hoặc "down" (breakout xuống — CẢNH BÁO, không mở lệnh mới,
+  // chỉ để tham khảo cho người đang cầm hàng cân nhắc thoát/cắt lỗ).
   let tradeGate = {
     active: false,
     dir: null,
@@ -7601,10 +7723,10 @@ function buildCMTModel(closes, volumes, dates, cfg) {
   const findBreakDate = (above) => {
     let j = closes.length - 1;
     while (j > 1) {
-      const wj = closes.slice(Math.max(0, j - 41), j - 1);
+      const wj = above ? H_.slice(Math.max(0, j - 41), j - 1) : L_.slice(Math.max(0, j - 41), j - 1);
       if (!wj.length) break;
-      const rj = Math.max(...wj),
-        sj = Math.min(...wj);
+      const rj = above ? Math.max(...wj) : null,
+        sj = !above ? Math.min(...wj) : null;
       const out = above ? closes[j - 1] > rj : closes[j - 1] < sj;
       if (!out) break;
       j--;
@@ -7626,7 +7748,7 @@ function buildCMTModel(closes, volumes, dates, cfg) {
   else if (lastC < S40)
     tradeGate = {
       active: true,
-      dir: "short",
+      dir: "down",
       state: "RUN_DOWN",
       level: S40,
       R: R40,
@@ -7639,7 +7761,7 @@ function buildCMTModel(closes, volumes, dates, cfg) {
     const near = Math.min(R40 - lastC, lastC - S40) / band40 < 0.15;
     tradeGate.state = near ? "NEAR_TRIGGER" : "IN_RANGE";
     tradeGate.distPct = (Math.min(R40 - lastC, lastC - S40) / lastC) * 100;
-    tradeGate.nextDir = lastC - S40 > R40 - lastC ? "long" : "short";
+    tradeGate.nextDir = lastC - S40 > R40 - lastC ? "long" : "down";
   }
 
   const lastRSI = rsiArr[rsiArr.length - 1],
@@ -7682,7 +7804,8 @@ function buildCMTModel(closes, volumes, dates, cfg) {
     winCloses,
     winDates,
     verdicts,
-    vol: av,
+    vol: highs && lows ? (atrTrue(highs, lows, closes, 14).slice(-1)[0] ?? av) : av,
+    volIsTrueATR: !!(highs && lows),
     digits: cfg.digits,
   };
 }
@@ -7702,7 +7825,7 @@ export default function App() {
   const [stockKey, setStockKey] = useState("VNM");
   const [layer, setLayer] = useState(6);
   const [tf, setTf] = useState("D");
-  const [dirChoice, setDirChoice] = useState("auto");
+  // TTCK VN không bán khống — không cần state chọn hướng, luôn là Long.
 
   const [capital, setCapital] = useState(100000000);
   const [riskPctIn, setRiskPctIn] = useState(1);
@@ -7763,7 +7886,7 @@ export default function App() {
       const d = batchData[sym];
       if (!d.closes || d.closes.length < 250) continue;
       const cfg = { key: sym, label: sym, digits: 0 };
-      rows.push(screenStock(cfg, d.closes, d.volumes, d.dates, screenOpts));
+      rows.push(screenStock(cfg, d.closes, d.volumes, d.dates, screenOpts, d.highs, d.lows));
     }
     return rows.sort((a, b) => b.score - a.score);
   }, [batchData, screenOpts]);
@@ -7773,42 +7896,45 @@ export default function App() {
 
   const model = useMemo(() => {
     if (!stockData || !stockData.closes || stockData.closes.length < 260) return null;
-    return buildCMTModel(stockData.closes, stockData.volumes, stockData.dates, cfg);
+    return buildCMTModel(stockData.closes, stockData.volumes, stockData.dates, cfg, stockData.highs, stockData.lows);
   }, [stockData, stockKey]);
 
   const hist = useMemo(() => {
     if (!stockData || !stockData.closes || stockData.closes.length < 260) return null;
-    const { closes, dates } = stockData;
-    const states = buildStates(closes);
+    const { closes, dates, highs, lows } = stockData;
+    const states = buildStates(closes, highs, lows);
     return {
       closes,
       dates,
-      events: scanPatternHistory(closes, dates),
-      rule: scanBreakoutRule(closes),
-      confl: backtestConfluenceRolling(closes),
+      events: scanPatternHistory(closes, dates, highs, lows),
+      rule: scanBreakoutRule(closes, highs, lows),
+      confl: backtestConfluenceRolling(closes, highs, lows),
       analog: analogProbabilities(closes, states),
-      system: backtestSystem(closes),
-      swings: scanSwings(closes, dates),
+      system: backtestSystem(closes, highs, lows),
+      swings: scanSwings(closes, dates, highs, lows),
     };
   }, [stockData]);
 
   const gate = model ? model.tradeGate : null;
-  const resolvedDir = useMemo(() => {
-    if (dirChoice !== "auto") return dirChoice;
-    if (gate && gate.active) return gate.dir;
-    if (gate && gate.nextDir) return gate.nextDir;
-    const row = screener && screener.find((r) => r.key === stockKey);
-    return row ? (row.bias === "down" ? "short" : "long") : "long";
-  }, [dirChoice, gate, screener, stockKey]);
+  const resolvedDir = "long"; // TTCK VN chỉ có chiều mua
 
   const hurstOpts = useMemo(() => ({ ...opts, riskPct: Math.max(0.1, riskPctIn) / 100 }), [opts, riskPctIn]);
   const hurstCache = useRef(new Map());
   const detail = useMemo(() => {
     if (!stockData || view !== "hurst") return null;
     if (!stockData.closes || stockData.closes.length < 260) return null;
-    const key = `${stockKey}|${resolvedDir}|${JSON.stringify(hurstOpts)}`;
+    const key = `${stockKey}|${JSON.stringify(hurstOpts)}`;
     if (hurstCache.current.has(key)) return hurstCache.current.get(key);
-    const res = runHurstAnalysis(stockData.closes, stockData.volumes, stockData.dates, hurstOpts, resolvedDir, cfg.digits);
+    const res = runHurstAnalysis(
+      stockData.closes,
+      stockData.volumes,
+      stockData.dates,
+      hurstOpts,
+      resolvedDir,
+      cfg.digits,
+      stockData.highs,
+      stockData.lows
+    );
     if (hurstCache.current.size > 8) hurstCache.current.clear();
     hurstCache.current.set(key, res);
     return res;
@@ -7816,7 +7942,6 @@ export default function App() {
 
   const openStockCMT = useCallback((key) => {
     setStockKey(key);
-    setDirChoice("auto");
     setView("cmt");
     setLayer(6);
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -7902,10 +8027,7 @@ export default function App() {
             <select
               className="pair"
               value={stockKey}
-              onChange={(e) => {
-                setStockKey(e.target.value);
-                setDirChoice("auto");
-              }}
+              onChange={(e) => setStockKey(e.target.value)}
             >
               {(vn30 || []).map((s) => (
                 <option key={s} value={s}>{s}</option>
@@ -8005,7 +8127,7 @@ export default function App() {
                 rsiArr={model.rsiArr}
                 macdArr={model.macdArr}
                 stochArr={model.stochArr}
-                bt={backtestConfluenceRolling(stockData.closes)}
+                bt={backtestConfluenceRolling(stockData.closes, stockData.highs, stockData.lows)}
                 trendD={model.frames.D.trend}
                 div={model.div}
               />
@@ -8015,6 +8137,7 @@ export default function App() {
                 allCloses={allClosesForMatrix}
                 matrixKeys={matrixKeys}
                 vol={model.vol}
+                volIsTrueATR={model.volIsTrueATR}
                 cfg={cfg}
                 digits={cfg.digits}
                 lastPrice={lastPrice}
@@ -8059,8 +8182,6 @@ export default function App() {
           <HurstTab
             cfg={cfg}
             dir={resolvedDir}
-            dirChoice={dirChoice}
-            setDirChoice={setDirChoice}
             opts={opts}
             setOpts={setOpts}
             detail={detail}
