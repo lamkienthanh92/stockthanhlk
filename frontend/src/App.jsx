@@ -3450,6 +3450,12 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       const slDist = entry * stopPct;
       const stop = entry - slDist;
       if (stop >= entry) continue;
+      // Lọc R:R tối thiểu: nếu TP tuần đã quá gần (VD giá vừa giảm 1 phiên
+      // nhưng đã sát kháng cự sẵn) thì phần thưởng không bù nổi rủi ro 10%
+      // cố định — bỏ qua lệnh này thay vì vào một kèo ăn ít mất nhiều.
+      const rewardDist = target - entry;
+      const minRR = opts.minRR || 1.5;
+      if (rewardDist < slDist * minRR) continue;
       pos = { i0: i, entry, stop, tp: target, slDist, state, phase: ph };
     }
   }
@@ -5102,7 +5108,7 @@ function LiveDeskPanel({ rows, openStock }) {
       title={`Đang giữ ${holding.length} mã${
         openedToday.length ? ` · mở mới hôm nay ${openedToday.length}` : ""
       }${closedToday.length ? ` · đóng hôm nay ${closedToday.length}` : ""}`}
-      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG TUẦN (dùng tuần trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. Cắt lỗ % cố định trên giá vào (không dùng ATR kiểu margin). Chỉ Long."
+      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG TUẦN (dùng tuần trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm, VÀ phần thưởng (TP) phải gấp đủ số lần rủi ro cố định mới vào lệnh. Chỉ Long."
     >
       {holding.length === 0 ? (
         <p className="sub">
@@ -7726,6 +7732,19 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
             />
           </div>
           <div>
+            <label className="lb">R:R tối thiểu — luật CMT×Hurst</label>
+            <input
+              className="inp"
+              style={{ width: 80 }}
+              type="number"
+              step="0.1"
+              min="0.5"
+              max="5"
+              value={opts.minRR}
+              onChange={(e) => setOpt("minRR", Math.max(0.5, Math.min(5, +e.target.value || 1.5)))}
+            />
+          </div>
+          <div>
             <label className="lb">Walk-forward folds</label>
             <input
               className="inp"
@@ -7996,7 +8015,9 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
             title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
             sub={`Luật: (1) CMT xác định hướng + TP trên KHUNG TUẦN (tuần trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. Cắt lỗ ${Math.round(
               opts.stopPct * 100
-            )}% trên giá vào (không dùng ATR kiểu margin). Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
+            )}% trên giá vào, chỉ vào khi TP ≥ ${opts.minRR.toFixed(
+              1
+            )}× khoảng cách SL. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
           >
             <div
               style={{
@@ -8409,6 +8430,7 @@ export default function App() {
     atrPeriod: 14,
     slMult: 2,
     stopPct: 0.1,
+    minRR: 1.5,
     minTrendStrength: 0,
     minPullbackATR: 0,
     rangeEnterThr: 0.2,
@@ -8451,12 +8473,13 @@ export default function App() {
       atrPeriod: opts.atrPeriod,
       slMult: opts.slMult,
       stopPct: opts.stopPct,
+      minRR: opts.minRR,
       riskPct: Math.max(0.1, riskPctIn) / 100,
       hurstWin: opts.hurstWin,
       hurstStep: opts.hurstStep,
       cardMaxHold: opts.cardMaxHold,
     }),
-    [opts.atrPeriod, opts.slMult, opts.stopPct, riskPctIn, opts.hurstWin, opts.hurstStep, opts.cardMaxHold]
+    [opts.atrPeriod, opts.slMult, opts.stopPct, opts.minRR, riskPctIn, opts.hurstWin, opts.hurstStep, opts.cardMaxHold]
   );
 
   const screener = useMemo(() => {
