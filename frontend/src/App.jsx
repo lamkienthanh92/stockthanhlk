@@ -3267,9 +3267,12 @@ function runProfitViewsWalkForward(
 // ============================================================
 // CMT trên khung THÁNG — cổ phiếu VN nên định hướng/kịch bản/TP ở khung lớn
 // hơn (ổn định, ít nhiễu, biên độ đủ rộng để TP không bị sát ngay khi vào
-// lệnh) rồi mới xuống ngày để bắt điểm vào. Mỗi ngày dùng R/S/target của
-// THÁNG TRƯỚC đã đóng hoàn chỉnh (không dùng tháng đang chạy — tránh nhìn
-// trước dữ liệu chưa xảy ra).
+// lệnh) rồi mới xuống ngày để bắt điểm vào. R/S lấy từ các THÁNG TRƯỚC đã
+// đóng hoàn chỉnh (ổn định, không nhìn trước); còn TRẠNG THÁI breakout thì
+// tính THEO NGÀY bằng High/Low cao/thấp nhất TỪ ĐẦU THÁNG HIỆN TẠI tới hôm
+// nay (không chờ tháng đóng xong, không nhìn trước vì chỉ dùng dữ liệu đã
+// qua trong chính tháng đang chạy) — nhạy hơn, bắt được cả nhịp xọc lên phá
+// kháng cự trong phiên chứ không cần đóng cửa cả tháng mới tính.
 function buildMonthlyCMT(closes, highs, lows, dates) {
   const n = closes.length;
   const H_ = highs || closes,
@@ -3291,15 +3294,12 @@ function buildMonthlyCMT(closes, highs, lows, dates) {
     dayMonthIdx[i] = m;
   }
 
-  // Pivot tháng (xác nhận sau 1 tháng — dữ liệu tháng thưa hơn tuần nên
-  // dùng độ trễ ngắn hơn để vẫn đủ điểm pivot) → R/S/hướng/target.
+  // R/S theo THÁNG — từ pivot tháng đã đóng (xác nhận sau 1 tháng).
   const pivMo = pivots(mo.closes, 1, moHL.highs, moHL.lows);
   let pm = 0;
   const MH = [],
     ML = [];
-  const monState = Array(nm).fill(null),
-    monTarget = Array(nm).fill(null),
-    monR = Array(nm).fill(null),
+  const monR = Array(nm).fill(null),
     monS = Array(nm).fill(null);
   for (let mm = 0; mm < nm; mm++) {
     while (pm < pivMo.length && pivMo[pm].i + 1 <= mm) {
@@ -3312,24 +3312,49 @@ function buildMonthlyCMT(closes, highs, lows, dates) {
     const m6H = moHL.highs.slice(Math.max(0, mm - 6), mm),
       m6L = moHL.lows.slice(Math.max(0, mm - 6), mm);
     if (!m6H.length) continue;
-    const R = overhead.length ? Math.min(...overhead) : Math.max(...m6H);
-    const S = below.length ? Math.max(...below) : Math.min(...m6L);
+    monR[mm] = overhead.length ? Math.min(...overhead) : Math.max(...m6H);
+    monS[mm] = below.length ? Math.max(...below) : Math.min(...m6L);
+  }
+
+  // Trạng thái/target THEO NGÀY: High/Low chạy dồn từ đầu tháng hiện tại
+  // tới ngày i, so với R/S của THÁNG TRƯỚC đã đóng (ổn định, không nhìn
+  // trước — tháng chứa ngày i chưa đóng nên không dùng R/S của chính nó).
+  const dayState = Array(n).fill(null),
+    dayTarget = Array(n).fill(null),
+    dayR = Array(n).fill(null),
+    dayS = Array(n).fill(null);
+  let runHigh = -Infinity,
+    runLow = Infinity,
+    curMon = -1;
+  for (let i = 0; i < n; i++) {
+    const mm = dayMonthIdx[i];
+    if (mm !== curMon) {
+      runHigh = -Infinity;
+      runLow = Infinity;
+      curMon = mm;
+    }
+    runHigh = Math.max(runHigh, H_[i]);
+    runLow = Math.min(runLow, L_[i]);
+    const prevMon = mm - 1;
+    const R = prevMon >= 0 ? monR[prevMon] : null;
+    const S = prevMon >= 0 ? monS[prevMon] : null;
+    if (R == null || S == null) continue;
+    dayR[i] = R;
+    dayS[i] = S;
     const range = Math.max(R - S, 1e-9);
-    monR[mm] = R;
-    monS[mm] = S;
-    if (c > R) {
-      monState[mm] = "RUN_UP";
-      monTarget[mm] = R + 0.618 * range;
-    } else if (c < S) {
-      monState[mm] = "RUN_DOWN";
-      monTarget[mm] = null;
+    if (runHigh > R) {
+      dayState[i] = "RUN_UP";
+      dayTarget[i] = R + 0.618 * range;
+    } else if (runLow < S) {
+      dayState[i] = "RUN_DOWN";
+      dayTarget[i] = null;
     } else {
-      monState[mm] = "IN_RANGE";
-      monTarget[mm] = R;
+      dayState[i] = "IN_RANGE";
+      dayTarget[i] = R;
     }
   }
 
-  return { dayMonthIdx, monState, monTarget, monR, monS, monDates: mo.dates, nm };
+  return { dayMonthIdx, dayState, dayTarget, dayR, dayS, monR, monS, monDates: mo.dates, nm };
 }
 
 // ============================================================
@@ -3455,10 +3480,9 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
         lo = L_[i],
         c = closes[i];
       const hitSL = lo <= pos.stop;
-      // Bảo vệ vốn theo khung THÁNG: nếu hỗ trợ của tháng trước đã bị giá
-      // đóng cửa phá — kịch bản tháng đã đổi, thoát hết dù chưa dính SL.
-      const mm = mCMT.dayMonthIdx[i] - 1;
-      const mS = mm >= 0 ? mCMT.monS[mm] : null;
+      // Bảo vệ vốn theo khung THÁNG: nếu hỗ trợ (của tháng trước đã đóng)
+      // bị giá đóng cửa phá — kịch bản tháng đã đổi, thoát hết dù chưa dính SL.
+      const mS = mCMT.dayS[i];
       const flipDown = mS != null && c < mS;
       const timeoutHit = i - pos.i0 >= maxHold;
 
@@ -3553,13 +3577,13 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     const j = i - 1;
     const lastC = closes[j];
 
-    // (1) CMT khung THÁNG: hướng + target — lấy tháng TRƯỚC tháng chứa ngày j
-    // Chỉ vào khi tháng ĐÃ BREAKOUT LÊN — bỏ hẳn kịch bản "trong biên" (dữ
-    // liệu backtest cho thấy trong biên thua lỗ nặng còn breakout thắng đều).
-    const mIdx = mCMT.dayMonthIdx[j] - 1;
-    if (mIdx < 0) continue;
-    const state = mCMT.monState[mIdx];
-    const target = mCMT.monTarget[mIdx];
+    // (1) CMT khung THÁNG: hướng + target — dùng trạng thái NGÀY j (High
+    // chạy dồn từ đầu tháng hiện tại tới ngày j, so với R/S tháng trước đã
+    // đóng) — nhạy hơn, không cần chờ cả tháng đóng cửa mới xác nhận.
+    // Chỉ vào khi ĐÃ BREAKOUT LÊN — bỏ hẳn kịch bản "trong biên" (dữ liệu
+    // backtest cho thấy trong biên thua lỗ nặng còn breakout thắng đều).
+    const state = mCMT.dayState[j];
+    const target = mCMT.dayTarget[j];
     if (state !== "RUN_UP" || target == null || target <= lastC) continue;
 
     // Đã bán 50% (đang chạy phần còn lại) thì không gom thêm nữa
@@ -5262,7 +5286,7 @@ function LiveDeskPanel({ rows, openStock }) {
       title={`Đang giữ ${holding.length} mã${
         openedToday.length ? ` · mở mới hôm nay ${openedToday.length}` : ""
       }${closedToday.length ? ` · đóng hôm nay ${closedToday.length}` : ""}`}
-      sub="Luật: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN (bỏ hẳn kịch bản trong biên), TP = target đo bằng biên độ mở rộng · (2) Xác nhận xu hướng khung TUẦN bằng bộ chỉ báo Trend, đảo chiều thì ngừng gom (không tự thoát) · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R. SL = pivot đáy ngày gần nhất (không phải % hay ATR). Chạm TP: bán 50%, phần còn lại chạy tiếp; thoát hết khi dính SL hoặc khung THÁNG chuyển kịch bản giảm. Chỉ Long."
+      sub="Luật: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN — xác nhận bằng High cao nhất tính từ đầu tháng tới hôm nay (không chờ tháng đóng cửa), TP = target đo bằng biên độ mở rộng · (2) Xác nhận xu hướng khung TUẦN bằng bộ chỉ báo Trend, đảo chiều thì ngừng gom (không tự thoát) · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R. SL = pivot đáy ngày gần nhất. Chạm TP: bán 50%, phần còn lại chạy tiếp; thoát hết khi dính SL hoặc khung THÁNG chuyển kịch bản giảm. Chỉ Long."
     >
       {holding.length === 0 ? (
         <p className="sub">
@@ -8177,7 +8201,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
           <Panel
             mod="Hurst · Backtest theo luật CMT × Trend"
             title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
-            sub={`Luật: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN (tháng trước đã đóng, bỏ kịch bản trong biên) · (2) Xác nhận khung TUẦN bằng bộ chỉ báo Trend, đảo chiều thì ngừng gom · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R (giá vào tính trung bình). SL = pivot đáy ngày gần nhất dưới giá vào TB (không dùng %/ATR), chỉ gom khi TP ≥ ${opts.minRR.toFixed(
+            sub={`Luật: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN — xác nhận bằng High cao nhất từ đầu tháng hiện tại tới hôm nay so với kháng cự tháng trước đã đóng (không chờ đóng cửa cả tháng) · (2) Xác nhận khung TUẦN bằng bộ chỉ báo Trend, đảo chiều thì ngừng gom · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R (giá vào tính trung bình). SL = pivot đáy ngày gần nhất dưới giá vào TB, chỉ gom khi TP ≥ ${opts.minRR.toFixed(
               1
             )}× khoảng cách SL. Chạm TP: bán 50%, phần còn lại chạy tiếp tới khi dính SL hoặc khung tháng chuyển kịch bản giảm. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
           >
