@@ -3384,21 +3384,24 @@ function netAtDefs(defs, i) {
 // trước), chỉ Long (TTCK VN không bán khống, mặc định CK VN đang trong xu
 // hướng tăng dài hạn nên không còn phân biệt regime Trend/Range của Hurst):
 //
-//  (1) CMT xác định HƯỚNG + TP trên KHUNG THÁNG (tháng trước đã đóng):
-//        · Tháng đã breakout lên: TP = R + 0.618×(R−S)
-//        · Tháng đang trong biên: TP = R tháng (kháng cự)
-//        · Tháng breakout xuống: KHÔNG vào lệnh, đang giữ thì thoát hết
+//  (1) CMT xác định HƯỚNG + TP trên KHUNG THÁNG (tháng trước đã đóng) —
+//      CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN (TP = R + 0.618×(R−S)); bỏ hẳn
+//      kịch bản "trong biên" (backtest cho thấy trong biên thua lỗ nặng ở
+//      hầu hết mã VN30, trong khi breakout thắng đều đặn hơn nhiều).
+//      Tháng đi ngang hoặc breakout xuống: KHÔNG vào lệnh.
 //  (2) Xác nhận xu hướng KHUNG TUẦN bằng đúng bộ 22 chỉ báo Trend (kể cả
 //      Volume) — đồng thuận tuần (tuần trước đã đóng) phải còn dương mới
 //      được GOM THÊM; quay ≤0 chỉ ngừng gom, không tự thoát lệnh.
 //  (3) Xuống khung NGÀY để GOM lệnh (DCA/pyramid): mỗi lần bộ chỉ báo Trend
 //      ngày đang NGHIÊNG MUA (>ngưỡng) VÀ giá vừa giảm VÀ TP vẫn gấp đủ số
-//      lần rủi ro cố định (R:R tối thiểu) — mua thêm, rủi ro % vốn như lần
-//      đầu, không giới hạn số lần. Giá vào TRUNG BÌNH cập nhật lại sau mỗi
-//      lần gom; SL cứng = giá vào trung bình × (1 − stopPct).
+//      lần rủi ro tối thiểu (R:R) — mua thêm, rủi ro % vốn như lần đầu,
+//      không giới hạn số lần. Giá vào TRUNG BÌNH cập nhật lại sau mỗi lần
+//      gom; SL = PIVOT ĐÁY NGÀY gần nhất phía dưới giá vào trung bình
+//      (không dùng % cố định hay ATR — dùng đúng đáy swing thật trên biểu
+//      đồ), lấy lại pivot mới sau mỗi lần gom.
 //      CHẠM TP: bán 50%, phần còn lại CHẠY TIẾP (ngừng gom thêm), không còn
-//      TP cho phần này nữa — chỉ thoát khi dính SL cứng hoặc khung THÁNG
-//      chuyển hẳn sang kịch bản giảm (hỗ trợ tháng vỡ / state RUN_DOWN).
+//      TP cho phần này nữa — chỉ thoát khi dính SL hoặc khung THÁNG chuyển
+//      hẳn sang kịch bản giảm (hỗ trợ tháng vỡ / state RUN_DOWN).
 // ============================================================
 const ENTRY_CONSENSUS_THR = 0.2;
 
@@ -3416,6 +3419,18 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   // (3) Bộ chỉ báo Trend khung NGÀY — bắt điểm gom hàng cụ thể
   const { trendDefs } = buildDefs(closes, volumes, highs, lows);
 
+  // Pivot đáy khung NGÀY dùng làm SL (thay cho % cố định) — xác nhận sau 4
+  // phiên như quy ước pivot ngày dùng ở nơi khác trong app. Tích luỹ nhân
+  // quả theo từng phiên để không nhìn trước.
+  const dPiv = pivots(closes, 4, highs, lows);
+  let pdi = 0;
+  const confirmedLows = [];
+  const nearestPivotLowBelow = (priceRef) => {
+    for (let k = confirmedLows.length - 1; k >= 0; k--)
+      if (confirmedLows[k] < priceRef) return confirmedLows[k];
+    return null;
+  };
+
   const trades = [];
   let pos = null;
   // TP nằm ở khung tháng (có thể là một move kéo dài nhiều tháng) nên thời
@@ -3423,11 +3438,16 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   // 120 phiên (~6 tháng); đặt quá ngắn sẽ khiến phần lớn lệnh bị "hết hạn
   // giữ" trước khi kịp đạt TP, kéo kết quả xuống dù R:R mỗi lệnh vẫn tốt.
   const maxHold = opts.cardMaxHold || 120;
-  const stopPct = opts.stopPct || 0.1;
+  const stopPct = opts.stopPct || 0.1; // chỉ dùng khi chưa có pivot đáy nào phía dưới
   const minRR = opts.minRR || 1.0;
   const start = Math.max(300, 210);
 
   for (let i = start; i < n; i++) {
+    // Xác nhận thêm pivot đáy tới ngày i-1 (chỉ dùng dữ liệu đã biết)
+    while (pdi < dPiv.length && dPiv[pdi].i + 4 <= i - 1) {
+      if (dPiv[pdi].type === "L") confirmedLows.push(dPiv[pdi].price);
+      pdi++;
+    }
     // (a) Quản lý vị thế đang mở — quét TP/SL bằng High/Low THẬT của phiên i
     let justExited = false;
     if (pos) {
@@ -3534,11 +3554,13 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     const lastC = closes[j];
 
     // (1) CMT khung THÁNG: hướng + target — lấy tháng TRƯỚC tháng chứa ngày j
+    // Chỉ vào khi tháng ĐÃ BREAKOUT LÊN — bỏ hẳn kịch bản "trong biên" (dữ
+    // liệu backtest cho thấy trong biên thua lỗ nặng còn breakout thắng đều).
     const mIdx = mCMT.dayMonthIdx[j] - 1;
     if (mIdx < 0) continue;
     const state = mCMT.monState[mIdx];
     const target = mCMT.monTarget[mIdx];
-    if (!state || state === "RUN_DOWN" || target == null || target <= lastC) continue;
+    if (state !== "RUN_UP" || target == null || target <= lastC) continue;
 
     // Đã bán 50% (đang chạy phần còn lại) thì không gom thêm nữa
     if (pos && pos.partialDone) continue;
@@ -3555,8 +3577,14 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     const pulledBack = j >= 1 && closes[j] < closes[j - 1];
     if (dailyConsensus > ENTRY_CONSENSUS_THR && pulledBack) {
       const entry = lastC;
+      // SL = pivot đáy NGÀY gần nhất phía dưới giá vào (không dùng % cố
+      // định) — nếu chưa có pivot đáy nào xác nhận phía dưới, tạm dùng %
+      // làm lưới an toàn dự phòng.
+      const pivotLow = nearestPivotLowBelow(entry);
+      const stopLevel = pivotLow != null ? pivotLow : entry * (1 - stopPct);
+      const slDistProxy = entry - stopLevel;
+      if (slDistProxy <= 0) continue;
       const rewardDist = target - entry;
-      const slDistProxy = entry * stopPct;
       if (rewardDist < slDistProxy * minRR) continue; // R:R không đủ — bỏ qua lần này
       if (!pos) {
         pos = {
@@ -3564,7 +3592,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
           lots: [{ idx: i, price: entry }],
           avgEntry: entry,
           slDist: slDistProxy,
-          stop: entry * (1 - stopPct),
+          stop: stopLevel,
           tp: target,
           state,
           partialDone: false,
@@ -3572,8 +3600,10 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       } else {
         pos.lots.push({ idx: i, price: entry });
         pos.avgEntry = pos.lots.reduce((s, l) => s + l.price, 0) / pos.lots.length;
-        pos.slDist = pos.avgEntry * stopPct;
-        pos.stop = pos.avgEntry * (1 - stopPct);
+        // Gom thêm: lấy lại pivot đáy gần nhất dưới giá vào TRUNG BÌNH mới
+        const pivotLow2 = nearestPivotLowBelow(pos.avgEntry);
+        pos.stop = pivotLow2 != null ? pivotLow2 : pos.avgEntry * (1 - stopPct);
+        pos.slDist = pos.avgEntry - pos.stop;
         pos.tp = target; // cập nhật theo target tháng mới nhất
         pos.state = state;
       }
@@ -5232,7 +5262,7 @@ function LiveDeskPanel({ rows, openStock }) {
       title={`Đang giữ ${holding.length} mã${
         openedToday.length ? ` · mở mới hôm nay ${openedToday.length}` : ""
       }${closedToday.length ? ` · đóng hôm nay ${closedToday.length}` : ""}`}
-      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG THÁNG (dùng tháng trước đã đóng) · (2) Xác nhận xu hướng khung TUẦN bằng bộ chỉ báo Trend, đảo chiều thì ngừng gom (không tự thoát) · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R (không giới hạn số lần). Chạm TP: bán 50%, phần còn lại chạy tiếp; thoát hết khi dính SL cứng hoặc khung THÁNG chuyển kịch bản giảm. Chỉ Long."
+      sub="Luật: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN (bỏ hẳn kịch bản trong biên), TP = target đo bằng biên độ mở rộng · (2) Xác nhận xu hướng khung TUẦN bằng bộ chỉ báo Trend, đảo chiều thì ngừng gom (không tự thoát) · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R. SL = pivot đáy ngày gần nhất (không phải % hay ATR). Chạm TP: bán 50%, phần còn lại chạy tiếp; thoát hết khi dính SL hoặc khung THÁNG chuyển kịch bản giảm. Chỉ Long."
     >
       {holding.length === 0 ? (
         <p className="sub">
@@ -7851,7 +7881,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
             />
           </div>
           <div>
-            <label className="lb">Cắt lỗ (%) — luật CMT×Hurst tháng</label>
+            <label className="lb">Cắt lỗ % dự phòng (khi chưa có pivot đáy)</label>
             <input
               className="inp"
               style={{ width: 80 }}
@@ -8147,9 +8177,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
           <Panel
             mod="Hurst · Backtest theo luật CMT × Trend"
             title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
-            sub={`Luật: (1) CMT xác định hướng + TP trên KHUNG THÁNG (tháng trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày GOM lệnh mỗi khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R (không giới hạn số lần, giá vào tính trung bình). Cắt lỗ cứng ${Math.round(
-              opts.stopPct * 100
-            )}% trên giá vào TB, chỉ gom khi TP ≥ ${opts.minRR.toFixed(
+            sub={`Luật: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN (tháng trước đã đóng, bỏ kịch bản trong biên) · (2) Xác nhận khung TUẦN bằng bộ chỉ báo Trend, đảo chiều thì ngừng gom · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R (giá vào tính trung bình). SL = pivot đáy ngày gần nhất dưới giá vào TB (không dùng %/ATR), chỉ gom khi TP ≥ ${opts.minRR.toFixed(
               1
             )}× khoảng cách SL. Chạm TP: bán 50%, phần còn lại chạy tiếp tới khi dính SL hoặc khung tháng chuyển kịch bản giảm. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
           >
