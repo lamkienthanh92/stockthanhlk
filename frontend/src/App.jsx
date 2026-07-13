@@ -3447,47 +3447,83 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
         // hỗ trợ, coi như thoát hết trước, không xét bán 50% nữa.
         const stoppedOut = hitSL || flipDown;
         const exit = hitSL ? pos.stop : c;
-        trades.push({
-          entryIdx: pos.i0,
-          exitIdx: i,
-          finalExitIdx: i,
-          side: 1,
-          entryPrice: pos.avgEntry,
-          exitPrice: exit,
-          finalExitPrice: exit,
-          slDistance: pos.slDist,
-          R: (exit - pos.avgEntry) / pos.slDist,
-          ret: (exit - pos.avgEntry) / pos.avgEntry,
-          priceDiff: exit - pos.avgEntry,
-          stoppedOut,
-          exitReason: hitSL ? "sl" : flipDown ? "flip" : "timeout",
-          scen: pos.state,
-          numAdds: pos.lots.length,
-          riskWeight: pos.partialDone ? 0.5 : 1,
-        });
+        const reason = hitSL ? "sl" : flipDown ? "flip" : "timeout";
+        if (pos.partialDone) {
+          // Nửa còn lại (đã chốt nửa kia tại TP) — 1 fragment rủi ro 0.5,
+          // tính từ đúng ngày bán 50% (không phải từ ngày gom đầu, vì phần
+          // rủi ro của giai đoạn trước đó đã ghi nhận riêng lúc chạm TP).
+          trades.push({
+            entryIdx: pos.partialAtIdx,
+            exitIdx: i,
+            finalExitIdx: i,
+            side: 1,
+            entryPrice: pos.avgEntry,
+            exitPrice: exit,
+            finalExitPrice: exit,
+            slDistance: pos.slDist,
+            R: (exit - pos.avgEntry) / pos.slDist,
+            ret: (exit - pos.avgEntry) / pos.avgEntry,
+            priceDiff: exit - pos.avgEntry,
+            stoppedOut,
+            exitReason: reason,
+            scen: pos.state,
+            numAdds: pos.lots.length,
+            riskWeight: 0.5,
+          });
+        } else {
+          // Chưa từng chạm TP — mỗi LẦN GOM là 1 fragment rủi ro đầy đủ
+          // (weight 1), tính từ đúng ngày gom đó tới lúc thoát, để rủi ro
+          // cộng dồn ĐÚNG theo số lần đã gom (không bị gộp phẳng về 1 đơn vị).
+          for (const lot of pos.lots) {
+            trades.push({
+              entryIdx: lot.idx,
+              exitIdx: i,
+              finalExitIdx: i,
+              side: 1,
+              entryPrice: lot.price,
+              exitPrice: exit,
+              finalExitPrice: exit,
+              slDistance: pos.slDist,
+              R: (exit - lot.price) / pos.slDist,
+              ret: (exit - lot.price) / lot.price,
+              priceDiff: exit - lot.price,
+              stoppedOut,
+              exitReason: reason,
+              scen: pos.state,
+              numAdds: pos.lots.length,
+              riskWeight: 1,
+            });
+          }
+        }
         pos = null;
         justExited = true;
       } else if (!pos.partialDone && pos.tp != null && hi >= pos.tp) {
         // Chạm TP: bán 50%, phần còn lại chạy tiếp — không đóng lệnh hẳn.
-        trades.push({
-          entryIdx: pos.i0,
-          exitIdx: i,
-          finalExitIdx: i,
-          side: 1,
-          entryPrice: pos.avgEntry,
-          exitPrice: pos.tp,
-          finalExitPrice: pos.tp,
-          slDistance: pos.slDist,
-          R: (pos.tp - pos.avgEntry) / pos.slDist,
-          ret: (pos.tp - pos.avgEntry) / pos.avgEntry,
-          priceDiff: pos.tp - pos.avgEntry,
-          stoppedOut: false,
-          exitReason: "tp_partial",
-          scen: pos.state,
-          numAdds: pos.lots.length,
-          riskWeight: 0.5,
-        });
+        // Ghi nhận rủi ro ĐẦY ĐỦ (weight 1) cho từng lần đã gom, từ đúng
+        // ngày gom tới ngày chạm TP hôm nay — đúng quy mô vị thế thật lúc
+        // chốt lời, không bị gộp phẳng về 1 đơn vị rủi ro như trước.
+        for (const lot of pos.lots) {
+          trades.push({
+            entryIdx: lot.idx,
+            exitIdx: i,
+            finalExitIdx: i,
+            side: 1,
+            entryPrice: lot.price,
+            exitPrice: pos.tp,
+            finalExitPrice: pos.tp,
+            slDistance: pos.slDist,
+            R: (pos.tp - lot.price) / pos.slDist,
+            ret: (pos.tp - lot.price) / lot.price,
+            priceDiff: pos.tp - lot.price,
+            stoppedOut: false,
+            exitReason: "tp_partial",
+            scen: pos.state,
+            numAdds: pos.lots.length,
+            riskWeight: 1,
+          });
+        }
         pos.partialDone = true;
+        pos.partialAtIdx = i; // mốc để tính fragment rủi ro 0.5 của nửa còn lại
         pos.tp = null; // không còn TP cho nửa còn lại — chạy tới khi SL/tháng đảo chiều
       }
     }
@@ -8181,7 +8217,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                     color={s.totalReturnPct >= 0 ? CLR.bull : CLR.bear}
                     sub={s.blown ? "" : fmtMoney(capital.value * s.finalMultiple)}
                   />
-                  <MetricBox label="Số lệnh" value={ts.count} sub={`giữ TB ${ts.avgHoldDays ? ts.avgHoldDays.toFixed(1) : "—"} phiên`} />
+                  <MetricBox label="Số lần gom" value={ts.count} sub={`mỗi lần gom tính rủi ro riêng · giữ TB ${ts.avgHoldDays ? ts.avgHoldDays.toFixed(1) : "—"} phiên`} />
                   <MetricBox label="Tỷ lệ thắng" value={isFinite(ts.hitRate) ? ts.hitRate.toFixed(0) + "%" : "—"} />
                   <MetricBox label="Sharpe (theo lệnh)" value={isFinite(ts.sharpe) ? ts.sharpe.toFixed(2) : "—"} />
                   <MetricBox label="Max Drawdown" value={`${s.maxDDPct.toFixed(1)}%`} color={CLR.bear} />
