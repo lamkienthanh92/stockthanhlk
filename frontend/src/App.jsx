@@ -5246,7 +5246,7 @@ function LiveDeskPanel({ rows, openStock }) {
                     {r.live.stop.toLocaleString("vi-VN")}
                   </td>
                   <td className="num" style={{ color: CLR.bull }}>
-                    {r.live.tp.toLocaleString("vi-VN")}
+                    {r.live.tp != null ? r.live.tp.toLocaleString("vi-VN") : "đã bán 50% — chạy tiếp"}
                   </td>
                   <td
                     className="num"
@@ -8141,7 +8141,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                   <Chip cls="mut">
                     Vào TB {cb.live.entryPrice.toLocaleString("vi-VN")} · SL{" "}
                     {cb.live.stop.toLocaleString("vi-VN")} · TP{" "}
-                    {cb.live.tp.toLocaleString("vi-VN")}
+                    {cb.live.tp != null ? cb.live.tp.toLocaleString("vi-VN") : "đã bán 50% — chạy tiếp"}
                   </Chip>
                   <Chip cls={cb.live.unrealizedPct >= 0 ? "up" : "down"}>
                     Tạm tính {cb.live.unrealizedPct >= 0 ? "+" : ""}
