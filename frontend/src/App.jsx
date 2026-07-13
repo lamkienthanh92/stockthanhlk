@@ -3381,7 +3381,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   // giữ" trước khi kịp đạt TP, kéo kết quả xuống dù R:R mỗi lệnh vẫn tốt.
   const maxHold = opts.cardMaxHold || 120;
   const stopPct = opts.stopPct || 0.1;
-  const minRR = opts.minRR || 1.5;
+  const minRR = opts.minRR || 1.0;
   const start = Math.max(300, opts.hurstWin + 10);
 
   for (let i = start; i < n; i++) {
@@ -7781,7 +7781,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
               min="0.5"
               max="5"
               value={opts.minRR}
-              onChange={(e) => setOpt("minRR", Math.max(0.5, Math.min(5, +e.target.value || 1.5)))}
+              onChange={(e) => setOpt("minRR", Math.max(0.5, Math.min(5, +e.target.value || 1.0)))}
             />
           </div>
           <div>
@@ -8475,7 +8475,7 @@ export default function App() {
     atrPeriod: 14,
     slMult: 2,
     stopPct: 0.1,
-    minRR: 1.5,
+    minRR: 1.0,
     minTrendStrength: 0,
     minPullbackATR: 0,
     rangeEnterThr: 0.2,
