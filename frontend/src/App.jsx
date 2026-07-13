@@ -3327,15 +3327,17 @@ function buildMonthlyCMT(closes, highs, lows, dates) {
 //      bộ chỉ báo tương ứng (22 Trend kể cả Volume, hoặc 20 Range) để
 //      lấy tín hiệu đồng thuận (net trung bình dấu, không lọc walk-forward
 //      để tính được nhanh cho cả 30 mã).
-//  (3) Xuống khung NGÀY để bắt điểm vào: đồng thuận bộ chỉ báo đang NGHIÊNG
-//      MUA (> ngưỡng) VÀ giá phiên quyết định vừa giảm so với phiên trước
-//      (mua theo nhịp giảm trong hướng/biên đã xác định ở (1)+(2)), VÀ TP
-//      phải gấp đủ số lần rủi ro cố định (bộ lọc R:R tối thiểu) mới vào.
-//      SL = entry × (1 − stopPct) — cắt lỗ % cố định (mặc định 10%), không
-//      dùng khung ATR kiểu tài khoản margin vì mua cổ phiếu VN bằng tiền mặt.
-//      Thoát khi High chạm TP tháng, Low chạm SL (quét thật trong phiên),
-//      hết thời gian giữ tối đa, hoặc hỗ trợ THÁNG bị phá khi đang giữ
-//      (bảo vệ vốn — kịch bản tháng đã đổi).
+//  (3) Xuống khung NGÀY để GOM lệnh (DCA/pyramid): mỗi lần bộ chỉ báo đang
+//      NGHIÊNG MUA (> ngưỡng) VÀ giá phiên quyết định vừa giảm so với phiên
+//      trước, VÀ TP vẫn gấp đủ số lần rủi ro cố định (bộ lọc R:R tối
+//      thiểu) — mua thêm, rủi ro % vốn như lần đầu, không giới hạn số lần.
+//      Giá vào TRUNG BÌNH cập nhật lại sau mỗi lần gom; SL cứng = giá vào
+//      trung bình × (1 − stopPct) làm lưới an toàn cuối cùng (không dùng
+//      ATR kiểu tài khoản margin vì mua cổ phiếu VN bằng tiền mặt).
+//      THOÁT TOÀN BỘ vị thế khi: High chạm TP tháng, Low chạm SL cứng (quét
+//      thật trong phiên), hỗ trợ THÁNG bị phá (kịch bản tháng đã đổi), HOẶC
+//      Hurst hết xu hướng — đổi phase HOẶC đồng thuận (của đúng bộ chỉ báo
+//      đang theo dõi từ lần gom gần nhất) quay về ≤0 — cái nào tới trước.
 // ============================================================
 const ENTRY_CONSENSUS_THR = 0.2;
 
@@ -3369,14 +3371,17 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     }
     return c ? s / c : 0;
   };
+  const poolOf = (ph) => (ph === "TREND" ? trendDefs : ph === "RANGE" ? rangeDefs : null);
 
   const trades = [];
   let pos = null;
   // TP nằm ở khung tháng (có thể là một move kéo dài nhiều tháng) nên thời
   // gian giữ tối đa phải đủ rộng để mục tiêu có cơ hội chạm tới — mặc định
-  // 120 phiên (~24 tuần); đặt quá ngắn sẽ khiến phần lớn lệnh bị "hết hạn
+  // 120 phiên (~6 tháng); đặt quá ngắn sẽ khiến phần lớn lệnh bị "hết hạn
   // giữ" trước khi kịp đạt TP, kéo kết quả xuống dù R:R mỗi lệnh vẫn tốt.
   const maxHold = opts.cardMaxHold || 120;
+  const stopPct = opts.stopPct || 0.1;
+  const minRR = opts.minRR || 1.5;
   const start = Math.max(300, opts.hurstWin + 10);
 
   for (let i = start; i < n; i++) {
@@ -3393,7 +3398,13 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       const mm = mCMT.dayMonthIdx[i] - 1;
       const mS = mm >= 0 ? mCMT.monS[mm] : null;
       const flipDown = mS != null && c < mS;
-      if (hitTP || hitSL || flipDown || i - pos.i0 >= maxHold) {
+      // Hurst hết xu hướng: đổi phase HOẶC đồng thuận (đúng bộ chỉ báo đang
+      // theo dõi từ lần gom gần nhất) quay về ≤0 — cái nào tới trước.
+      const phToday = phase[i - 1] ?? null;
+      const poolPos = poolOf(pos.phase);
+      const consPos = poolPos ? netAt(poolPos, i - 1) : -1;
+      const hurstEnd = phToday !== pos.phase || consPos <= 0;
+      if (hitTP || hitSL || flipDown || hurstEnd || i - pos.i0 >= maxHold) {
         const stoppedOut = hitSL || flipDown;
         const exit = hitSL ? pos.stop : hitTP ? pos.tp : c;
         trades.push({
@@ -3401,22 +3412,31 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
           exitIdx: i,
           finalExitIdx: i,
           side: 1,
-          entryPrice: pos.entry,
+          entryPrice: pos.avgEntry,
           exitPrice: exit,
           finalExitPrice: exit,
           slDistance: pos.slDist,
-          R: (exit - pos.entry) / pos.slDist,
-          ret: (exit - pos.entry) / pos.entry,
-          priceDiff: exit - pos.entry,
+          R: (exit - pos.avgEntry) / pos.slDist,
+          ret: (exit - pos.avgEntry) / pos.avgEntry,
+          priceDiff: exit - pos.avgEntry,
           stoppedOut,
-          exitReason: hitTP ? "tp" : hitSL ? "sl" : flipDown ? "flip" : "timeout",
+          exitReason: hitTP
+            ? "tp"
+            : hitSL
+            ? "sl"
+            : flipDown
+            ? "flip"
+            : hurstEnd
+            ? "hurst_end"
+            : "timeout",
           scen: pos.state,
+          numAdds: pos.lots.length,
         });
         pos = null;
         justExited = true;
       }
     }
-    if (pos || justExited) continue;
+    if (justExited) continue;
 
     // (b) Ngày quyết định j = i-1 (chỉ dùng dữ liệu đã biết)
     const j = i - 1;
@@ -3432,29 +3452,38 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
 
     // (2) Hurst chọn bộ chỉ báo theo regime của ngày j
     const ph = phase[j];
-    const pool = ph === "TREND" ? trendDefs : ph === "RANGE" ? rangeDefs : null;
+    const pool = poolOf(ph);
     if (!pool) continue;
     const consensus = netAt(pool, j);
 
-    // (3) Xuống khung ngày bắt điểm vào: đồng thuận mua + giá vừa giảm
+    // (3) Xuống khung ngày: đồng thuận mua + giá vừa giảm → mở lệnh mới
+    // hoặc GOM THÊM nếu đang giữ, miễn còn đủ R:R với TP tháng hiện tại.
     const pulledBack = j >= 1 && closes[j] < closes[j - 1];
     if (consensus > ENTRY_CONSENSUS_THR && pulledBack) {
-      // TTCK VN mua bằng tiền mặt, không cần khung "R theo ATR" kiểu tài
-      // khoản margin — cắt lỗ đơn giản bằng % cố định trên giá vào (mặc
-      // định 10%). "R" trong kết quả vẫn giữ lại làm đơn vị rủi ro chuẩn
-      // hoá (R=1 nghĩa là lỗ đúng 10%), chỉ đổi cách đo khoảng cách SL.
-      const stopPct = opts.stopPct || 0.1;
       const entry = lastC;
-      const slDist = entry * stopPct;
-      const stop = entry - slDist;
-      if (stop >= entry) continue;
-      // Lọc R:R tối thiểu: nếu TP tháng đã quá gần (VD giá vừa giảm 1 phiên
-      // nhưng đã sát kháng cự sẵn) thì phần thưởng không bù nổi rủi ro 10%
-      // cố định — bỏ qua lệnh này thay vì vào một kèo ăn ít mất nhiều.
       const rewardDist = target - entry;
-      const minRR = opts.minRR || 1.5;
-      if (rewardDist < slDist * minRR) continue;
-      pos = { i0: i, entry, stop, tp: target, slDist, state, phase: ph };
+      const slDistProxy = entry * stopPct;
+      if (rewardDist < slDistProxy * minRR) continue; // R:R không đủ — bỏ qua lần này
+      if (!pos) {
+        pos = {
+          i0: i,
+          lots: [{ idx: i, price: entry }],
+          avgEntry: entry,
+          slDist: slDistProxy,
+          stop: entry * (1 - stopPct),
+          tp: target,
+          state,
+          phase: ph,
+        };
+      } else {
+        pos.lots.push({ idx: i, price: entry });
+        pos.avgEntry = pos.lots.reduce((s, l) => s + l.price, 0) / pos.lots.length;
+        pos.slDist = pos.avgEntry * stopPct;
+        pos.stop = pos.avgEntry * (1 - stopPct);
+        pos.tp = target; // cập nhật theo target tháng mới nhất
+        pos.state = state;
+        pos.phase = ph; // làm mới mốc theo dõi "Hurst hết xu hướng"
+      }
     }
   }
 
@@ -3466,15 +3495,18 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       active: true,
       entryIdx: pos.i0,
       entryDate: dates[pos.i0],
-      entryPrice: pos.entry,
+      entryPrice: pos.avgEntry,
+      numAdds: pos.lots.length,
+      lastAddDate: dates[pos.lots[pos.lots.length - 1].idx],
       stop: pos.stop,
       tp: pos.tp,
       cmtState: pos.state,
       hurstPhase: pos.phase,
       daysHeld: n - 1 - pos.i0,
-      unrealizedR: (lastC - pos.entry) / pos.slDist,
-      unrealizedPct: (lastC / pos.entry - 1) * 100,
+      unrealizedR: (lastC - pos.avgEntry) / pos.slDist,
+      unrealizedPct: (lastC / pos.avgEntry - 1) * 100,
       openedToday: pos.i0 === n - 1,
+      addedToday: pos.lots.length > 1 && pos.lots[pos.lots.length - 1].idx === n - 1,
     };
   } else {
     const lastTrade = trades[trades.length - 1];
@@ -3485,6 +3517,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
             date: dates[lastTrade.exitIdx],
             reason: lastTrade.exitReason,
             R: lastTrade.R,
+            numAdds: lastTrade.numAdds,
             exitedToday: lastTrade.exitIdx === n - 1,
           }
         : null,
@@ -5097,7 +5130,7 @@ function LiveDeskPanel({ rows, openStock }) {
   const closedToday = rows.filter(
     (r) => r.live && !r.live.active && r.live.lastExit && r.live.lastExit.exitedToday
   );
-  const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
+  const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ", hurst_end: "Hurst hết xu hướng" };
   const stateVN = { RUN_UP: "breakout tháng", IN_RANGE: "trong biên tháng" };
   const fmtPct = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
   return (
@@ -5106,7 +5139,7 @@ function LiveDeskPanel({ rows, openStock }) {
       title={`Đang giữ ${holding.length} mã${
         openedToday.length ? ` · mở mới hôm nay ${openedToday.length}` : ""
       }${closedToday.length ? ` · đóng hôm nay ${closedToday.length}` : ""}`}
-      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG THÁNG (dùng tháng trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm, VÀ phần thưởng (TP) phải gấp đủ số lần rủi ro cố định mới vào lệnh. Chỉ Long."
+      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG THÁNG (dùng tháng trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày GOM lệnh mỗi khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R (không giới hạn số lần); thoát toàn bộ khi chạm TP/SL cứng/hỗ trợ tháng vỡ/Hurst hết xu hướng. Chỉ Long."
     >
       {holding.length === 0 ? (
         <p className="sub">
@@ -5119,25 +5152,34 @@ function LiveDeskPanel({ rows, openStock }) {
             <thead>
               <tr>
                 <th>Mã</th>
-                <th>Vào từ</th>
+                <th>Vào lần đầu</th>
+                <th>Số lần gom</th>
                 <th>Số phiên giữ</th>
-                <th>Giá vào</th>
+                <th>Giá vào TB</th>
                 <th>SL</th>
                 <th>TP</th>
                 <th>Lãi/lỗ tạm tính</th>
-                <th>Bối cảnh lúc vào</th>
+                <th>Bối cảnh</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
               {holding.map((r) => (
-                <tr key={r.key} className={r.live.openedToday ? "hot" : undefined}>
+                <tr key={r.key} className={r.live.openedToday || r.live.addedToday ? "hot" : undefined}>
                   <td style={{ fontWeight: 800 }}>{r.label}</td>
                   <td className="num">
                     {r.live.entryDate}
                     {r.live.openedToday && (
                       <Chip cls="up" style={{ marginLeft: 6 }}>
                         MỞ HÔM NAY
+                      </Chip>
+                    )}
+                  </td>
+                  <td className="num">
+                    {r.live.numAdds}
+                    {r.live.addedToday && (
+                      <Chip cls="up" style={{ marginLeft: 6 }}>
+                        GOM THÊM HÔM NAY
                       </Chip>
                     )}
                   </td>
@@ -5182,7 +5224,7 @@ function LiveDeskPanel({ rows, openStock }) {
               <Chip key={r.key} cls={r.live.lastExit.R >= 0 ? "up" : "down"}>
                 {r.label}: {reasonVN[r.live.lastExit.reason] || r.live.lastExit.reason} (
                 {r.live.lastExit.R >= 0 ? "+" : ""}
-                {r.live.lastExit.R.toFixed(2)}R)
+                {r.live.lastExit.R.toFixed(2)}R, gom {r.live.lastExit.numAdds} lần)
               </Chip>
             ))}
           </div>
@@ -5384,7 +5426,7 @@ function ScreenerSection({ rows, openStock }) {
                     {r.live && r.live.active ? (
                       <span style={{ color: CLR.bull, fontWeight: 700 }}>
                         Đang giữ từ {r.live.entryDate}
-                        {r.live.openedToday ? " · MỚI" : ` (${r.live.daysHeld}p)`}
+                        {r.live.openedToday ? " · MỚI" : ` (${r.live.daysHeld}p, gom ${r.live.numAdds}x)`}
                       </span>
                     ) : r.live && r.live.lastExit && r.live.lastExit.exitedToday ? (
                       <span style={{ color: CLR.amber, fontWeight: 700 }}>
@@ -8005,17 +8047,17 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
           IN_RANGE: "Mua theo pullback ngày, tháng đang trong biên",
         };
         const scenRows = Object.entries(cb.byScen).sort((a, b) => b[1].n - a[1].n);
-        const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
+        const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ", hurst_end: "Hurst hết xu hướng" };
         const stateVN2 = { RUN_UP: "breakout tháng", IN_RANGE: "trong biên tháng" };
         return (
           <Panel
             mod="Hurst · Backtest theo luật CMT × Hurst"
             title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
-            sub={`Luật: (1) CMT xác định hướng + TP trên KHUNG THÁNG (tháng trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. Cắt lỗ ${Math.round(
+            sub={`Luật: (1) CMT xác định hướng + TP trên KHUNG THÁNG (tháng trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày GOM lệnh mỗi khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R (không giới hạn số lần, giá vào tính trung bình). Cắt lỗ cứng ${Math.round(
               opts.stopPct * 100
-            )}% trên giá vào, chỉ vào khi TP ≥ ${opts.minRR.toFixed(
+            )}% trên giá vào TB, chỉ gom khi TP ≥ ${opts.minRR.toFixed(
               1
-            )}× khoảng cách SL. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
+            )}× khoảng cách SL; thoát toàn bộ khi chạm TP/SL/hỗ trợ tháng vỡ/Hurst hết xu hướng. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
           >
             <div
               style={{
@@ -8035,8 +8077,11 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                     ● Đang giữ từ {cb.live.entryDate}
                     {cb.live.openedToday ? " (MỚI HÔM NAY)" : ` (${cb.live.daysHeld} phiên)`}
                   </Chip>
+                  <Chip cls={cb.live.addedToday ? "up" : "mut"}>
+                    Đã gom {cb.live.numAdds} lần{cb.live.addedToday ? " · THÊM HÔM NAY" : ""} · lần gần nhất {cb.live.lastAddDate}
+                  </Chip>
                   <Chip cls="mut">
-                    Vào {cb.live.entryPrice.toLocaleString("vi-VN")} · SL{" "}
+                    Vào TB {cb.live.entryPrice.toLocaleString("vi-VN")} · SL{" "}
                     {cb.live.stop.toLocaleString("vi-VN")} · TP{" "}
                     {cb.live.tp.toLocaleString("vi-VN")}
                   </Chip>
@@ -8053,7 +8098,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                   <Chip cls="side">● Đang chờ tín hiệu — chưa có lệnh mở</Chip>
                   {cb.live.lastExit && (
                     <Chip cls={cb.live.lastExit.R >= 0 ? "up" : "down"}>
-                      Lệnh gần nhất đóng {cb.live.lastExit.date} —{" "}
+                      Lệnh gần nhất đóng {cb.live.lastExit.date} (đã gom {cb.live.lastExit.numAdds} lần) —{" "}
                       {reasonVN[cb.live.lastExit.reason] || cb.live.lastExit.reason} (
                       {cb.live.lastExit.R >= 0 ? "+" : ""}
                       {cb.live.lastExit.R.toFixed(2)}R)
