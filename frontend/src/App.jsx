@@ -3245,75 +3245,71 @@ function runProfitViewsWalkForward(
 }
 
 // ============================================================
-// CMT trên khung TUẦN — cổ phiếu VN nên định hướng/kịch bản/TP ở khung lớn
-// hơn (ổn định, ít nhiễu) rồi mới xuống ngày để bắt điểm vào. Mỗi ngày dùng
-// R/S/target của TUẦN TRƯỚC đã đóng hoàn chỉnh (không dùng tuần đang chạy
-// — tránh nhìn trước dữ liệu chưa xảy ra).
-function buildWeeklyCMT(closes, highs, lows, dates) {
+// CMT trên khung THÁNG — cổ phiếu VN nên định hướng/kịch bản/TP ở khung lớn
+// hơn (ổn định, ít nhiễu, biên độ đủ rộng để TP không bị sát ngay khi vào
+// lệnh) rồi mới xuống ngày để bắt điểm vào. Mỗi ngày dùng R/S/target của
+// THÁNG TRƯỚC đã đóng hoàn chỉnh (không dùng tháng đang chạy — tránh nhìn
+// trước dữ liệu chưa xảy ra).
+function buildMonthlyCMT(closes, highs, lows, dates) {
   const n = closes.length;
   const H_ = highs || closes,
     L_ = lows || closes;
-  const wk = aggWeekly(closes, dates);
-  const wkHL = aggWeeklyHL(H_, L_, dates);
-  const nw = wk.closes.length;
+  const mo = aggMonthly(closes, dates);
+  const moHL = aggMonthlyHL(H_, L_, dates);
+  const nm = mo.closes.length;
 
-  // Ngày → chỉ số tuần chứa ngày đó (đúng quy tắc nhóm tuần Monday-start
-  // như aggWeekly đang dùng ở những nơi khác trong app).
-  const dayWeekIdx = Array(n).fill(0);
-  let w = -1,
+  // Ngày → chỉ số tháng chứa ngày đó.
+  const dayMonthIdx = Array(n).fill(0);
+  let m = -1,
     curKey = null;
   for (let i = 0; i < n; i++) {
-    const dt = new Date(dates[i] + "T00:00:00Z");
-    const day = (dt.getUTCDay() + 6) % 7;
-    const mon = new Date(dt);
-    mon.setUTCDate(dt.getUTCDate() - day);
-    const key = mon.toISOString().slice(0, 10);
+    const key = dates[i].slice(0, 7);
     if (key !== curKey) {
-      w++;
+      m++;
       curKey = key;
     }
-    dayWeekIdx[i] = w;
+    dayMonthIdx[i] = m;
   }
 
-  // Pivot tuần (xác nhận sau 2 tuần — cùng quy ước Dow theory tuần dùng ở
-  // Module 1) → R/S/hướng/target y hệt logic CMT hàng ngày nhưng ở cấp tuần.
-  const pivW = pivots(wk.closes, 2, wkHL.highs, wkHL.lows);
-  let pw = 0;
-  const WH = [],
-    WL = [];
-  const weekState = Array(nw).fill(null),
-    weekTarget = Array(nw).fill(null),
-    weekR = Array(nw).fill(null),
-    weekS = Array(nw).fill(null);
-  for (let ww = 0; ww < nw; ww++) {
-    while (pw < pivW.length && pivW[pw].i + 2 <= ww) {
-      (pivW[pw].type === "H" ? WH : WL).push(pivW[pw]);
-      pw++;
+  // Pivot tháng (xác nhận sau 1 tháng — dữ liệu tháng thưa hơn tuần nên
+  // dùng độ trễ ngắn hơn để vẫn đủ điểm pivot) → R/S/hướng/target.
+  const pivMo = pivots(mo.closes, 1, moHL.highs, moHL.lows);
+  let pm = 0;
+  const MH = [],
+    ML = [];
+  const monState = Array(nm).fill(null),
+    monTarget = Array(nm).fill(null),
+    monR = Array(nm).fill(null),
+    monS = Array(nm).fill(null);
+  for (let mm = 0; mm < nm; mm++) {
+    while (pm < pivMo.length && pivMo[pm].i + 1 <= mm) {
+      (pivMo[pm].type === "H" ? MH : ML).push(pivMo[pm]);
+      pm++;
     }
-    const c = wk.closes[ww];
-    const overhead = WH.filter((p) => p.price > c).map((p) => p.price);
-    const below = WL.filter((p) => p.price < c).map((p) => p.price);
-    const w10H = wkHL.highs.slice(Math.max(0, ww - 10), ww),
-      w10L = wkHL.lows.slice(Math.max(0, ww - 10), ww);
-    if (!w10H.length) continue;
-    const R = overhead.length ? Math.min(...overhead) : Math.max(...w10H);
-    const S = below.length ? Math.max(...below) : Math.min(...w10L);
+    const c = mo.closes[mm];
+    const overhead = MH.filter((p) => p.price > c).map((p) => p.price);
+    const below = ML.filter((p) => p.price < c).map((p) => p.price);
+    const m6H = moHL.highs.slice(Math.max(0, mm - 6), mm),
+      m6L = moHL.lows.slice(Math.max(0, mm - 6), mm);
+    if (!m6H.length) continue;
+    const R = overhead.length ? Math.min(...overhead) : Math.max(...m6H);
+    const S = below.length ? Math.max(...below) : Math.min(...m6L);
     const range = Math.max(R - S, 1e-9);
-    weekR[ww] = R;
-    weekS[ww] = S;
+    monR[mm] = R;
+    monS[mm] = S;
     if (c > R) {
-      weekState[ww] = "RUN_UP";
-      weekTarget[ww] = R + 0.618 * range;
+      monState[mm] = "RUN_UP";
+      monTarget[mm] = R + 0.618 * range;
     } else if (c < S) {
-      weekState[ww] = "RUN_DOWN";
-      weekTarget[ww] = null;
+      monState[mm] = "RUN_DOWN";
+      monTarget[mm] = null;
     } else {
-      weekState[ww] = "IN_RANGE";
-      weekTarget[ww] = R;
+      monState[mm] = "IN_RANGE";
+      monTarget[mm] = R;
     }
   }
 
-  return { dayWeekIdx, weekState, weekTarget, weekR, weekS, weekDates: wk.dates, nw };
+  return { dayMonthIdx, monState, monTarget, monR, monS, monDates: mo.dates, nm };
 }
 
 // ============================================================
@@ -3321,23 +3317,25 @@ function buildWeeklyCMT(closes, highs, lows, dates) {
 // trạng thái "đang sống" hiển thị trên Bộ lọc. Hoàn toàn nhân quả
 // (không nhìn trước), chỉ Long (TTCK VN không bán khống):
 //
-//  (1) CMT xác định HƯỚNG + TP trên KHUNG TUẦN (ổn định hơn khung ngày):
-//      R/S lấy từ pivot đỉnh/đáy tuần gần nhất, dùng tuần TRƯỚC đã đóng.
-//        · Tuần đã breakout lên (đóng tuần > R tuần): TP = R + 0.618×(R−S)
-//        · Tuần đang trong biên: TP = R tuần (kháng cự)
-//        · Tuần breakout xuống: KHÔNG vào lệnh
+//  (1) CMT xác định HƯỚNG + TP trên KHUNG THÁNG (ổn định hơn tuần/ngày,
+//      biên độ đủ rộng để TP không bị sát ngay lúc vào lệnh):
+//      R/S lấy từ pivot đỉnh/đáy tháng gần nhất, dùng tháng TRƯỚC đã đóng.
+//        · Tháng đã breakout lên (đóng tháng > R tháng): TP = R + 0.618×(R−S)
+//        · Tháng đang trong biên: TP = R tháng (kháng cự)
+//        · Tháng breakout xuống: KHÔNG vào lệnh
 //  (2) Hurst xác định regime Trend/Range của NGÀY quyết định → chọn đúng
 //      bộ chỉ báo tương ứng (22 Trend kể cả Volume, hoặc 20 Range) để
 //      lấy tín hiệu đồng thuận (net trung bình dấu, không lọc walk-forward
 //      để tính được nhanh cho cả 30 mã).
 //  (3) Xuống khung NGÀY để bắt điểm vào: đồng thuận bộ chỉ báo đang NGHIÊNG
 //      MUA (> ngưỡng) VÀ giá phiên quyết định vừa giảm so với phiên trước
-//      (mua theo nhịp giảm trong hướng/biên đã xác định ở (1)+(2)).
+//      (mua theo nhịp giảm trong hướng/biên đã xác định ở (1)+(2)), VÀ TP
+//      phải gấp đủ số lần rủi ro cố định (bộ lọc R:R tối thiểu) mới vào.
 //      SL = entry × (1 − stopPct) — cắt lỗ % cố định (mặc định 10%), không
 //      dùng khung ATR kiểu tài khoản margin vì mua cổ phiếu VN bằng tiền mặt.
-//      Thoát khi High chạm TP tuần, Low chạm SL (quét thật trong phiên),
-//      hết thời gian giữ tối đa, hoặc hỗ trợ TUẦN bị phá khi đang giữ
-//      (bảo vệ vốn — kịch bản tuần đã đổi).
+//      Thoát khi High chạm TP tháng, Low chạm SL (quét thật trong phiên),
+//      hết thời gian giữ tối đa, hoặc hỗ trợ THÁNG bị phá khi đang giữ
+//      (bảo vệ vốn — kịch bản tháng đã đổi).
 // ============================================================
 const ENTRY_CONSENSUS_THR = 0.2;
 
@@ -3346,8 +3344,8 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   const H_ = highs || closes,
     L_ = lows || closes;
 
-  // (1) CMT khung TUẦN — hướng, R/S, target cho toàn bộ lịch sử một lần
-  const wCMT = buildWeeklyCMT(closes, highs, lows, dates);
+  // (1) CMT khung THÁNG — hướng, R/S, target cho toàn bộ lịch sử một lần
+  const mCMT = buildMonthlyCMT(closes, highs, lows, dates);
 
   // (2) Hurst phase — phân loại nhanh (buffer/stableWin cố định, không dò
   // walk-forward) để tính được cho cả rổ 30 mã mà không quá nặng.
@@ -3374,7 +3372,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
 
   const trades = [];
   let pos = null;
-  // TP nằm ở khung tuần (có thể là một move kéo dài nhiều tuần) nên thời
+  // TP nằm ở khung tháng (có thể là một move kéo dài nhiều tháng) nên thời
   // gian giữ tối đa phải đủ rộng để mục tiêu có cơ hội chạm tới — mặc định
   // 120 phiên (~24 tuần); đặt quá ngắn sẽ khiến phần lớn lệnh bị "hết hạn
   // giữ" trước khi kịp đạt TP, kéo kết quả xuống dù R:R mỗi lệnh vẫn tốt.
@@ -3390,11 +3388,11 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
         c = closes[i];
       const hitTP = hi >= pos.tp;
       const hitSL = lo <= pos.stop;
-      // Bảo vệ vốn theo khung TUẦN: nếu hỗ trợ của tuần trước đã bị giá
-      // đóng cửa phá — kịch bản tuần đã đổi, không chờ SL ngày nữa.
-      const ww = wCMT.dayWeekIdx[i] - 1;
-      const wS = ww >= 0 ? wCMT.weekS[ww] : null;
-      const flipDown = wS != null && c < wS;
+      // Bảo vệ vốn theo khung THÁNG: nếu hỗ trợ của tháng trước đã bị giá
+      // đóng cửa phá — kịch bản tháng đã đổi, không chờ SL ngày nữa.
+      const mm = mCMT.dayMonthIdx[i] - 1;
+      const mS = mm >= 0 ? mCMT.monS[mm] : null;
+      const flipDown = mS != null && c < mS;
       if (hitTP || hitSL || flipDown || i - pos.i0 >= maxHold) {
         const stoppedOut = hitSL || flipDown;
         const exit = hitSL ? pos.stop : hitTP ? pos.tp : c;
@@ -3424,12 +3422,12 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     const j = i - 1;
     const lastC = closes[j];
 
-    // (1) CMT khung TUẦN: hướng + target — lấy tuần TRƯỚC tuần chứa ngày j
-    // (tuần chứa j có thể chưa đóng xong, không dùng để tránh nhìn trước)
-    const wIdx = wCMT.dayWeekIdx[j] - 1;
-    if (wIdx < 0) continue;
-    const state = wCMT.weekState[wIdx];
-    const target = wCMT.weekTarget[wIdx];
+    // (1) CMT khung THÁNG: hướng + target — lấy tháng TRƯỚC tháng chứa ngày j
+    // (tháng chứa j có thể chưa đóng xong, không dùng để tránh nhìn trước)
+    const mIdx = mCMT.dayMonthIdx[j] - 1;
+    if (mIdx < 0) continue;
+    const state = mCMT.monState[mIdx];
+    const target = mCMT.monTarget[mIdx];
     if (!state || state === "RUN_DOWN" || target == null || target <= lastC) continue;
 
     // (2) Hurst chọn bộ chỉ báo theo regime của ngày j
@@ -3450,7 +3448,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       const slDist = entry * stopPct;
       const stop = entry - slDist;
       if (stop >= entry) continue;
-      // Lọc R:R tối thiểu: nếu TP tuần đã quá gần (VD giá vừa giảm 1 phiên
+      // Lọc R:R tối thiểu: nếu TP tháng đã quá gần (VD giá vừa giảm 1 phiên
       // nhưng đã sát kháng cự sẵn) thì phần thưởng không bù nổi rủi ro 10%
       // cố định — bỏ qua lệnh này thay vì vào một kèo ăn ít mất nhiều.
       const rewardDist = target - entry;
@@ -5100,7 +5098,7 @@ function LiveDeskPanel({ rows, openStock }) {
     (r) => r.live && !r.live.active && r.live.lastExit && r.live.lastExit.exitedToday
   );
   const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
-  const stateVN = { RUN_UP: "breakout tuần", IN_RANGE: "trong biên tuần" };
+  const stateVN = { RUN_UP: "breakout tháng", IN_RANGE: "trong biên tháng" };
   const fmtPct = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
   return (
     <Panel
@@ -5108,7 +5106,7 @@ function LiveDeskPanel({ rows, openStock }) {
       title={`Đang giữ ${holding.length} mã${
         openedToday.length ? ` · mở mới hôm nay ${openedToday.length}` : ""
       }${closedToday.length ? ` · đóng hôm nay ${closedToday.length}` : ""}`}
-      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG TUẦN (dùng tuần trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm, VÀ phần thưởng (TP) phải gấp đủ số lần rủi ro cố định mới vào lệnh. Chỉ Long."
+      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG THÁNG (dùng tháng trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm, VÀ phần thưởng (TP) phải gấp đủ số lần rủi ro cố định mới vào lệnh. Chỉ Long."
     >
       {holding.length === 0 ? (
         <p className="sub">
@@ -5798,7 +5796,7 @@ function StructureLayer({ dates, closes, highs, lows, digits, patterns, scens, s
       <Panel
         mod="Module 2 · Elliott Wave"
         title="Kịch bản đếm sóng song song"
-        sub="Đếm sóng ở KHUNG TUẦN (ổn định hơn ngày) — mang tính chủ quan cao, hệ thống trình bày các kịch bản khả dĩ kèm xác suất tương đối, không khẳng định một đáp án."
+        sub="Đếm sóng ở KHUNG THÁNG (ổn định hơn tuần/ngày) — mang tính chủ quan cao, hệ thống trình bày các kịch bản khả dĩ kèm xác suất tương đối, không khẳng định một đáp án."
       >
         {swings && swings.cur && swings.up.n > 0 && swings.down.n > 0 && (
           <div className="scen" style={{ borderColor: "rgba(233,180,76,.4)" }}>
@@ -5863,7 +5861,7 @@ function StructureLayer({ dates, closes, highs, lows, digits, patterns, scens, s
       <Panel
         mod="Module 2 · Chart Patterns"
         title="Mẫu hình cổ điển đang theo dõi"
-        sub="Nhận diện ở KHUNG TUẦN từ đỉnh/đáy High/Low thật; target đo bằng chiều cao mẫu hình."
+        sub="Nhận diện ở KHUNG THÁNG từ đỉnh/đáy High/Low thật; target đo bằng chiều cao mẫu hình."
       >
         {patterns.length === 0 && (
           <p className="sub">
@@ -5903,7 +5901,7 @@ function StructureLayer({ dates, closes, highs, lows, digits, patterns, scens, s
           </div>
         ))}
       </Panel>
-      <Panel mod="Biểu đồ" title="Khung tuần — overlay nhãn sóng & neckline">
+      <Panel mod="Biểu đồ" title="Khung tháng — overlay nhãn sóng & neckline">
         <PriceChart
           dates={dates}
           closes={closes}
@@ -6493,7 +6491,7 @@ function PlaybookLayer({ cfg, pb, dates, closes, highs, lows, digits, ma50, ma20
       <Panel
         mod="Tổng hợp workflow"
         title={`Kịch bản giao dịch — ${cfg.label}`}
-        sub="Đầu ra của trình tự CMT: hỗ trợ/kháng cự và kịch bản A·B·C xác định từ pivot TUẦN thật (ổn định hơn ngày); mỗi nhánh là một kế hoạch if-then với trigger, target, mức vô hiệu và bằng chứng trích từ đúng lớp phân tích sinh ra nó. Giá hiện tại vẫn cập nhật theo từng phiên ngày."
+        sub="Đầu ra của trình tự CMT: hỗ trợ/kháng cự và kịch bản A·B·C xác định từ pivot THÁNG thật (ổn định hơn tuần/ngày); mỗi nhánh là một kế hoạch if-then với trigger, target, mức vô hiệu và bằng chứng trích từ đúng lớp phân tích sinh ra nó. Giá hiện tại vẫn cập nhật theo từng phiên ngày."
       >
         <div
           style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}
@@ -7664,7 +7662,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
       <Panel
         mod="Hurst · Tham số mô phỏng"
         title="Vốn & rủi ro của bạn"
-        sub="Áp cho backtest và mô phỏng tài khoản. TTCK VN không có bán khống nên toàn bộ hệ thống chỉ mở lệnh Mua (Long) — khi CMT báo breakdown, hệ thống đứng ngoài thay vì mở lệnh ngược. TP nay tính theo khung tuần nên 'Giữ tối đa' cần đủ rộng để mục tiêu có cơ hội chạm tới."
+        sub="Áp cho backtest và mô phỏng tài khoản. TTCK VN không có bán khống nên toàn bộ hệ thống chỉ mở lệnh Mua (Long) — khi CMT báo breakdown, hệ thống đứng ngoài thay vì mở lệnh ngược. TP nay tính theo khung tháng nên 'Giữ tối đa' cần đủ rộng để mục tiêu có cơ hội chạm tới."
       >
         <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-end" }}>
           <div>
@@ -7717,7 +7715,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
             />
           </div>
           <div>
-            <label className="lb">Cắt lỗ (%) — luật CMT×Hurst tuần</label>
+            <label className="lb">Cắt lỗ (%) — luật CMT×Hurst tháng</label>
             <input
               className="inp"
               style={{ width: 80 }}
@@ -7757,7 +7755,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
             />
           </div>
           <div>
-            <label className="lb">Giữ tối đa (phiên) — luật tuần</label>
+            <label className="lb">Giữ tối đa (phiên) — luật tháng</label>
             <input
               className="inp"
               style={{ width: 90 }}
@@ -8003,17 +8001,17 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
           ts = cb.tradeStats,
           wl = cb.winLoss;
         const scenName = {
-          RUN_UP: "Mua theo pullback ngày, tuần đang breakout",
-          IN_RANGE: "Mua theo pullback ngày, tuần đang trong biên",
+          RUN_UP: "Mua theo pullback ngày, tháng đang breakout",
+          IN_RANGE: "Mua theo pullback ngày, tháng đang trong biên",
         };
         const scenRows = Object.entries(cb.byScen).sort((a, b) => b[1].n - a[1].n);
         const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
-        const stateVN2 = { RUN_UP: "breakout tuần", IN_RANGE: "trong biên tuần" };
+        const stateVN2 = { RUN_UP: "breakout tháng", IN_RANGE: "trong biên tháng" };
         return (
           <Panel
             mod="Hurst · Backtest theo luật CMT × Hurst"
             title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
-            sub={`Luật: (1) CMT xác định hướng + TP trên KHUNG TUẦN (tuần trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. Cắt lỗ ${Math.round(
+            sub={`Luật: (1) CMT xác định hướng + TP trên KHUNG THÁNG (tháng trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày bắt điểm vào khi bộ chỉ báo đồng thuận mua và giá vừa giảm. Cắt lỗ ${Math.round(
               opts.stopPct * 100
             )}% trên giá vào, chỉ vào khi TP ≥ ${opts.minRR.toFixed(
               1
@@ -8124,7 +8122,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                 </div>
                 <div className="grid2" style={{ marginTop: 14 }}>
                   <div>
-                    <div className="sub" style={{ marginBottom: 4 }}>Theo bối cảnh CMT tuần lúc vào</div>
+                    <div className="sub" style={{ marginBottom: 4 }}>Theo bối cảnh CMT tháng lúc vào</div>
                     <table className="tbl">
                       <thead>
                         <tr><th>Loại lệnh</th><th>Số</th><th>Thắng</th><th>Tổng R</th></tr>
@@ -8226,6 +8224,8 @@ function buildCMTModel(closes, volumes, dates, cfg, highs, lows) {
   wk.ma200 = sma(wk.closes, 200);
   mo.highs = moHL.highs;
   mo.lows = moHL.lows;
+  mo.ma50 = sma(mo.closes, 50);
+  mo.ma200 = sma(mo.closes, 200);
   const pivD = pivots(closes, 4, highs, lows);
   const pivW = pivots(wk.closes, 2, wkHL.highs, wkHL.lows);
   const pivM = pivots(mo.closes, 2, moHL.highs, moHL.lows);
@@ -8241,19 +8241,19 @@ function buildCMTModel(closes, volumes, dates, cfg, highs, lows) {
   };
   const cascade = stepDownCascade(closes, dates, highs, lows);
 
-  // Kịch bản (Elliott, mẫu hình, Playbook A/B/C) tính trên khung TUẦN — ổn
-  // định hơn, đúng ý "CMT ở khung lớn, chỉ xuống ngày để bắt điểm vào".
-  // Riêng lớp xác nhận (Module 3: RSI/MACD/MA) và giá "hiện tại" vẫn lấy
-  // từ khung ngày, vì đó là trạng thái tức thời cần theo dõi từng phiên.
+  // Kịch bản (Elliott, mẫu hình, Playbook A/B/C) tính trên khung THÁNG — ổn
+  // định hơn tuần/ngày, biên độ đủ rộng để TP không bị sát ngay lúc vào
+  // lệnh. Riêng lớp xác nhận (Module 3: RSI/MACD/MA) và giá "hiện tại" vẫn
+  // lấy từ khung ngày, vì đó là trạng thái tức thời cần theo dõi từng phiên.
   const av = volProxy(closes).slice(-1)[0] ?? 0;
-  const avW = volProxy(wk.closes).slice(-1)[0] ?? 0;
-  const winWeeks = Math.min(120, wk.closes.length);
-  const winCloses = wk.closes.slice(-winWeeks),
-    winDates = wk.dates.slice(-winWeeks);
-  const winHighs = wk.highs.slice(-winWeeks),
-    winLows = wk.lows.slice(-winWeeks);
-  const pivWin = pivots(winCloses, 2, winHighs, winLows);
-  const patterns = detectPatterns(winCloses, pivWin, avW * 3, cfg.digits);
+  const avM = volProxy(mo.closes).slice(-1)[0] ?? 0;
+  const winMonths = Math.min(96, mo.closes.length);
+  const winCloses = mo.closes.slice(-winMonths),
+    winDates = mo.dates.slice(-winMonths);
+  const winHighs = mo.highs.slice(-winMonths),
+    winLows = mo.lows.slice(-winMonths);
+  const pivWin = pivots(winCloses, 1, winHighs, winLows);
+  const patterns = detectPatterns(winCloses, pivWin, avM * 3, cfg.digits);
   const scens = elliottScenarios(pivWin, cfg.digits);
 
   const rsiArr = rsi(closes),
@@ -8272,8 +8272,8 @@ function buildCMTModel(closes, volumes, dates, cfg, highs, lows) {
   };
 
   // buildPlaybook nhận `closes` đầy đủ khung ngày (để "last" = giá hiện tại
-  // thật) nhưng `piv` là pivot TUẦN — R/S/target/kịch bản A·B·C theo đó đều
-  // ở khung tuần, chỉ vị trí giá hiện tại được cập nhật theo từng phiên.
+  // thật) nhưng `piv` là pivot THÁNG — R/S/target/kịch bản A·B·C theo đó đều
+  // ở khung tháng, chỉ vị trí giá hiện tại được cập nhật theo từng phiên.
   const playbook = buildPlaybook({
     closes,
     piv: pivWin.map((p) => ({ ...p })),
@@ -8761,8 +8761,8 @@ export default function App() {
                 highs={model.winHighs}
                 lows={model.winLows}
                 digits={cfg.digits}
-                ma50={model.wk.ma50.slice(-model.winCloses.length)}
-                ma200={model.wk.ma200.slice(-model.winCloses.length)}
+                ma50={model.mo.ma50.slice(-model.winCloses.length)}
+                ma200={model.mo.ma200.slice(-model.winCloses.length)}
                 goLayer={setLayer}
                 analog={hist ? hist.analog : null}
               />
