@@ -331,6 +331,26 @@ function aggWeeklyHL(highs, lows, dates) {
   });
   return { highs: oh, lows: ol, dates: wd };
 }
+// Tổng khối lượng khớp lệnh trong tuần — cần cho 2 chỉ báo Volume trong bộ
+// 22 chỉ báo Trend khi tính đồng thuận ở khung tuần.
+function aggWeeklyVolume(volumes, dates) {
+  const ov = [];
+  let cur = null;
+  volumes.forEach((v, i) => {
+    const dt = new Date(dates[i] + "T00:00:00Z");
+    const day = (dt.getUTCDay() + 6) % 7;
+    const mon = new Date(dt);
+    mon.setUTCDate(dt.getUTCDate() - day);
+    const key = mon.toISOString().slice(0, 10);
+    if (key !== cur) {
+      ov.push(v);
+      cur = key;
+    } else {
+      ov[ov.length - 1] += v;
+    }
+  });
+  return ov;
+}
 function aggMonthlyHL(highs, lows, dates) {
   const oh = [],
     ol = [],
@@ -2506,7 +2526,7 @@ function simulateEquityDaily(trades, closes, n, riskPct = 0.01) {
   const open = new Map();
   const daily = Array(n).fill(0);
   for (let day = 1; day < n; day++) {
-    for (const t of opensOn[day]) open.set(t, riskPct);
+    for (const t of opensOn[day]) open.set(t, riskPct * (t.riskWeight ?? 1));
     let pnl = 0;
     for (const [t, risk] of open) {
       const price = day === t.finalExitIdx ? t.finalExitPrice : closes[day];
@@ -3313,31 +3333,72 @@ function buildMonthlyCMT(closes, highs, lows, dates) {
 }
 
 // ============================================================
-// LUẬT GIAO DỊCH CMT × HURST — dùng chung cho backtest lịch sử VÀ
-// trạng thái "đang sống" hiển thị trên Bộ lọc. Hoàn toàn nhân quả
-// (không nhìn trước), chỉ Long (TTCK VN không bán khống):
+// CMT × chỉ báo Trend TUẦN — xác nhận xu hướng còn nguyên hay không bằng
+// đúng bộ 22 chỉ báo Trend (kể cả Volume) dùng ở tab Hurst, nhưng tính trên
+// KHUNG TUẦN thay vì để Hurst tự dò regime Trend/Range mỗi ngày. Dùng tuần
+// TRƯỚC đã đóng (nhân quả, không nhìn trước). Đồng thuận tuần quay ≤0 chỉ
+// NGỪNG GOM THÊM — không tự thoát lệnh (thoát hoàn toàn do khung THÁNG quyết).
+function buildWeeklyTrendGate(closes, volumes, highs, lows, dates) {
+  const n = closes.length;
+  const H_ = highs || closes,
+    L_ = lows || closes;
+  const wk = aggWeekly(closes, dates);
+  const wkHL = aggWeeklyHL(H_, L_, dates);
+  const wkVol = aggWeeklyVolume(volumes, dates);
+  const nw = wk.closes.length;
+  const { trendDefs } = buildDefs(wk.closes, wkVol, wkHL.highs, wkHL.lows);
+  const weekNet = Array(nw).fill(0);
+  for (let w = 0; w < nw; w++) weekNet[w] = netAtDefs(trendDefs, w);
+
+  const dayWeekIdx = Array(n).fill(0);
+  let w = -1,
+    curKey = null;
+  for (let i = 0; i < n; i++) {
+    const dt = new Date(dates[i] + "T00:00:00Z");
+    const day = (dt.getUTCDay() + 6) % 7;
+    const mon = new Date(dt);
+    mon.setUTCDate(dt.getUTCDate() - day);
+    const key = mon.toISOString().slice(0, 10);
+    if (key !== curKey) {
+      w++;
+      curKey = key;
+    }
+    dayWeekIdx[i] = w;
+  }
+  return { dayWeekIdx, weekNet, nw };
+}
+function netAtDefs(defs, i) {
+  let s = 0,
+    c = 0;
+  for (let k = 0; k < defs.length; k++) {
+    const v = defs[k][2](i);
+    s += v > 0 ? 1 : v < 0 ? -1 : 0;
+    c++;
+  }
+  return c ? s / c : 0;
+}
+
+// ============================================================
+// LUẬT GIAO DỊCH CMT × TREND — dùng chung cho backtest lịch sử VÀ trạng
+// thái "đang sống" hiển thị trên Bộ lọc. Hoàn toàn nhân quả (không nhìn
+// trước), chỉ Long (TTCK VN không bán khống, mặc định CK VN đang trong xu
+// hướng tăng dài hạn nên không còn phân biệt regime Trend/Range của Hurst):
 //
-//  (1) CMT xác định HƯỚNG + TP trên KHUNG THÁNG (ổn định hơn tuần/ngày,
-//      biên độ đủ rộng để TP không bị sát ngay lúc vào lệnh):
-//      R/S lấy từ pivot đỉnh/đáy tháng gần nhất, dùng tháng TRƯỚC đã đóng.
-//        · Tháng đã breakout lên (đóng tháng > R tháng): TP = R + 0.618×(R−S)
+//  (1) CMT xác định HƯỚNG + TP trên KHUNG THÁNG (tháng trước đã đóng):
+//        · Tháng đã breakout lên: TP = R + 0.618×(R−S)
 //        · Tháng đang trong biên: TP = R tháng (kháng cự)
-//        · Tháng breakout xuống: KHÔNG vào lệnh
-//  (2) Hurst xác định regime Trend/Range của NGÀY quyết định → chọn đúng
-//      bộ chỉ báo tương ứng (22 Trend kể cả Volume, hoặc 20 Range) để
-//      lấy tín hiệu đồng thuận (net trung bình dấu, không lọc walk-forward
-//      để tính được nhanh cho cả 30 mã).
-//  (3) Xuống khung NGÀY để GOM lệnh (DCA/pyramid): mỗi lần bộ chỉ báo đang
-//      NGHIÊNG MUA (> ngưỡng) VÀ giá phiên quyết định vừa giảm so với phiên
-//      trước, VÀ TP vẫn gấp đủ số lần rủi ro cố định (bộ lọc R:R tối
-//      thiểu) — mua thêm, rủi ro % vốn như lần đầu, không giới hạn số lần.
-//      Giá vào TRUNG BÌNH cập nhật lại sau mỗi lần gom; SL cứng = giá vào
-//      trung bình × (1 − stopPct) làm lưới an toàn cuối cùng (không dùng
-//      ATR kiểu tài khoản margin vì mua cổ phiếu VN bằng tiền mặt).
-//      THOÁT TOÀN BỘ vị thế khi: High chạm TP tháng, Low chạm SL cứng (quét
-//      thật trong phiên), hỗ trợ THÁNG bị phá (kịch bản tháng đã đổi), HOẶC
-//      Hurst hết xu hướng — đổi phase HOẶC đồng thuận (của đúng bộ chỉ báo
-//      đang theo dõi từ lần gom gần nhất) quay về ≤0 — cái nào tới trước.
+//        · Tháng breakout xuống: KHÔNG vào lệnh, đang giữ thì thoát hết
+//  (2) Xác nhận xu hướng KHUNG TUẦN bằng đúng bộ 22 chỉ báo Trend (kể cả
+//      Volume) — đồng thuận tuần (tuần trước đã đóng) phải còn dương mới
+//      được GOM THÊM; quay ≤0 chỉ ngừng gom, không tự thoát lệnh.
+//  (3) Xuống khung NGÀY để GOM lệnh (DCA/pyramid): mỗi lần bộ chỉ báo Trend
+//      ngày đang NGHIÊNG MUA (>ngưỡng) VÀ giá vừa giảm VÀ TP vẫn gấp đủ số
+//      lần rủi ro cố định (R:R tối thiểu) — mua thêm, rủi ro % vốn như lần
+//      đầu, không giới hạn số lần. Giá vào TRUNG BÌNH cập nhật lại sau mỗi
+//      lần gom; SL cứng = giá vào trung bình × (1 − stopPct).
+//      CHẠM TP: bán 50%, phần còn lại CHẠY TIẾP (ngừng gom thêm), không còn
+//      TP cho phần này nữa — chỉ thoát khi dính SL cứng hoặc khung THÁNG
+//      chuyển hẳn sang kịch bản giảm (hỗ trợ tháng vỡ / state RUN_DOWN).
 // ============================================================
 const ENTRY_CONSENSUS_THR = 0.2;
 
@@ -3349,29 +3410,11 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   // (1) CMT khung THÁNG — hướng, R/S, target cho toàn bộ lịch sử một lần
   const mCMT = buildMonthlyCMT(closes, highs, lows, dates);
 
-  // (2) Hurst phase — phân loại nhanh (buffer/stableWin cố định, không dò
-  // walk-forward) để tính được cho cả rổ 30 mã mà không quá nặng.
-  const rets = Array(n).fill(0);
-  for (let i = 1; i < n; i++) rets[i] = Math.log(closes[i] / closes[i - 1]);
-  const hurstDense = denseHurst(
-    rollingHurst(rets.slice(1), opts.hurstWin, opts.hurstStep),
-    n
-  );
-  const phase = classifyPhase(hurstDense, n, 5, 0.03);
+  // (2) Xác nhận xu hướng khung TUẦN — thay cho việc Hurst dò regime hàng ngày
+  const wGate = buildWeeklyTrendGate(closes, volumes, highs, lows, dates);
 
-  // (2) Đúng bộ 22 chỉ báo Trend (kể cả Volume) / 20 chỉ báo Range dùng ở tab Hurst
-  const { trendDefs, rangeDefs } = buildDefs(closes, volumes, highs, lows);
-  const netAt = (defs, i) => {
-    let s = 0,
-      c = 0;
-    for (let k = 0; k < defs.length; k++) {
-      const v = defs[k][2](i);
-      s += v > 0 ? 1 : v < 0 ? -1 : 0;
-      c++;
-    }
-    return c ? s / c : 0;
-  };
-  const poolOf = (ph) => (ph === "TREND" ? trendDefs : ph === "RANGE" ? rangeDefs : null);
+  // (3) Bộ chỉ báo Trend khung NGÀY — bắt điểm gom hàng cụ thể
+  const { trendDefs } = buildDefs(closes, volumes, highs, lows);
 
   const trades = [];
   let pos = null;
@@ -3382,7 +3425,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   const maxHold = opts.cardMaxHold || 120;
   const stopPct = opts.stopPct || 0.1;
   const minRR = opts.minRR || 1.0;
-  const start = Math.max(300, opts.hurstWin + 10);
+  const start = Math.max(300, 210);
 
   for (let i = start; i < n; i++) {
     // (a) Quản lý vị thế đang mở — quét TP/SL bằng High/Low THẬT của phiên i
@@ -3391,22 +3434,19 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       const hi = H_[i],
         lo = L_[i],
         c = closes[i];
-      const hitTP = hi >= pos.tp;
       const hitSL = lo <= pos.stop;
       // Bảo vệ vốn theo khung THÁNG: nếu hỗ trợ của tháng trước đã bị giá
-      // đóng cửa phá — kịch bản tháng đã đổi, không chờ SL ngày nữa.
+      // đóng cửa phá — kịch bản tháng đã đổi, thoát hết dù chưa dính SL.
       const mm = mCMT.dayMonthIdx[i] - 1;
       const mS = mm >= 0 ? mCMT.monS[mm] : null;
       const flipDown = mS != null && c < mS;
-      // Hurst hết xu hướng: đổi phase HOẶC đồng thuận (đúng bộ chỉ báo đang
-      // theo dõi từ lần gom gần nhất) quay về ≤0 — cái nào tới trước.
-      const phToday = phase[i - 1] ?? null;
-      const poolPos = poolOf(pos.phase);
-      const consPos = poolPos ? netAt(poolPos, i - 1) : -1;
-      const hurstEnd = phToday !== pos.phase || consPos <= 0;
-      if (hitTP || hitSL || flipDown || hurstEnd || i - pos.i0 >= maxHold) {
+      const timeoutHit = i - pos.i0 >= maxHold;
+
+      if (hitSL || flipDown || timeoutHit) {
+        // Ưu tiên bảo toàn vốn: nếu cùng phiên vừa chạm TP vừa dính SL/vỡ
+        // hỗ trợ, coi như thoát hết trước, không xét bán 50% nữa.
         const stoppedOut = hitSL || flipDown;
-        const exit = hitSL ? pos.stop : hitTP ? pos.tp : c;
+        const exit = hitSL ? pos.stop : c;
         trades.push({
           entryIdx: pos.i0,
           exitIdx: i,
@@ -3420,20 +3460,35 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
           ret: (exit - pos.avgEntry) / pos.avgEntry,
           priceDiff: exit - pos.avgEntry,
           stoppedOut,
-          exitReason: hitTP
-            ? "tp"
-            : hitSL
-            ? "sl"
-            : flipDown
-            ? "flip"
-            : hurstEnd
-            ? "hurst_end"
-            : "timeout",
+          exitReason: hitSL ? "sl" : flipDown ? "flip" : "timeout",
           scen: pos.state,
           numAdds: pos.lots.length,
+          riskWeight: pos.partialDone ? 0.5 : 1,
         });
         pos = null;
         justExited = true;
+      } else if (!pos.partialDone && pos.tp != null && hi >= pos.tp) {
+        // Chạm TP: bán 50%, phần còn lại chạy tiếp — không đóng lệnh hẳn.
+        trades.push({
+          entryIdx: pos.i0,
+          exitIdx: i,
+          finalExitIdx: i,
+          side: 1,
+          entryPrice: pos.avgEntry,
+          exitPrice: pos.tp,
+          finalExitPrice: pos.tp,
+          slDistance: pos.slDist,
+          R: (pos.tp - pos.avgEntry) / pos.slDist,
+          ret: (pos.tp - pos.avgEntry) / pos.avgEntry,
+          priceDiff: pos.tp - pos.avgEntry,
+          stoppedOut: false,
+          exitReason: "tp_partial",
+          scen: pos.state,
+          numAdds: pos.lots.length,
+          riskWeight: 0.5,
+        });
+        pos.partialDone = true;
+        pos.tp = null; // không còn TP cho nửa còn lại — chạy tới khi SL/tháng đảo chiều
       }
     }
     if (justExited) continue;
@@ -3443,23 +3498,26 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     const lastC = closes[j];
 
     // (1) CMT khung THÁNG: hướng + target — lấy tháng TRƯỚC tháng chứa ngày j
-    // (tháng chứa j có thể chưa đóng xong, không dùng để tránh nhìn trước)
     const mIdx = mCMT.dayMonthIdx[j] - 1;
     if (mIdx < 0) continue;
     const state = mCMT.monState[mIdx];
     const target = mCMT.monTarget[mIdx];
     if (!state || state === "RUN_DOWN" || target == null || target <= lastC) continue;
 
-    // (2) Hurst chọn bộ chỉ báo theo regime của ngày j
-    const ph = phase[j];
-    const pool = poolOf(ph);
-    if (!pool) continue;
-    const consensus = netAt(pool, j);
+    // Đã bán 50% (đang chạy phần còn lại) thì không gom thêm nữa
+    if (pos && pos.partialDone) continue;
+
+    // (2) Xác nhận khung TUẦN: đồng thuận tuần trước phải còn dương mới gom
+    const wIdx = wGate.dayWeekIdx[j] - 1;
+    if (wIdx < 0) continue;
+    const weeklyOK = wGate.weekNet[wIdx] > 0;
+    if (!weeklyOK) continue;
 
     // (3) Xuống khung ngày: đồng thuận mua + giá vừa giảm → mở lệnh mới
     // hoặc GOM THÊM nếu đang giữ, miễn còn đủ R:R với TP tháng hiện tại.
+    const dailyConsensus = netAtDefs(trendDefs, j);
     const pulledBack = j >= 1 && closes[j] < closes[j - 1];
-    if (consensus > ENTRY_CONSENSUS_THR && pulledBack) {
+    if (dailyConsensus > ENTRY_CONSENSUS_THR && pulledBack) {
       const entry = lastC;
       const rewardDist = target - entry;
       const slDistProxy = entry * stopPct;
@@ -3473,7 +3531,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
           stop: entry * (1 - stopPct),
           tp: target,
           state,
-          phase: ph,
+          partialDone: false,
         };
       } else {
         pos.lots.push({ idx: i, price: entry });
@@ -3482,7 +3540,6 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
         pos.stop = pos.avgEntry * (1 - stopPct);
         pos.tp = target; // cập nhật theo target tháng mới nhất
         pos.state = state;
-        pos.phase = ph; // làm mới mốc theo dõi "Hurst hết xu hướng"
       }
     }
   }
@@ -3500,8 +3557,8 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       lastAddDate: dates[pos.lots[pos.lots.length - 1].idx],
       stop: pos.stop,
       tp: pos.tp,
+      partialDone: pos.partialDone,
       cmtState: pos.state,
-      hurstPhase: pos.phase,
       daysHeld: n - 1 - pos.i0,
       unrealizedR: (lastC - pos.avgEntry) / pos.slDist,
       unrealizedPct: (lastC / pos.avgEntry - 1) * 100,
@@ -5130,16 +5187,16 @@ function LiveDeskPanel({ rows, openStock }) {
   const closedToday = rows.filter(
     (r) => r.live && !r.live.active && r.live.lastExit && r.live.lastExit.exitedToday
   );
-  const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ", hurst_end: "Hurst hết xu hướng" };
+  const reasonVN = { tp: "chạm TP", tp_partial: "chạm TP (bán 50%)", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
   const stateVN = { RUN_UP: "breakout tháng", IN_RANGE: "trong biên tháng" };
   const fmtPct = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
   return (
     <Panel
-      mod="Bàn lệnh · Luật CMT × Hurst"
+      mod="Bàn lệnh · Luật CMT × Trend"
       title={`Đang giữ ${holding.length} mã${
         openedToday.length ? ` · mở mới hôm nay ${openedToday.length}` : ""
       }${closedToday.length ? ` · đóng hôm nay ${closedToday.length}` : ""}`}
-      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG THÁNG (dùng tháng trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày GOM lệnh mỗi khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R (không giới hạn số lần); thoát toàn bộ khi chạm TP/SL cứng/hỗ trợ tháng vỡ/Hurst hết xu hướng. Chỉ Long."
+      sub="Luật: (1) CMT xác định hướng + TP trên KHUNG THÁNG (dùng tháng trước đã đóng) · (2) Xác nhận xu hướng khung TUẦN bằng bộ chỉ báo Trend, đảo chiều thì ngừng gom (không tự thoát) · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R (không giới hạn số lần). Chạm TP: bán 50%, phần còn lại chạy tiếp; thoát hết khi dính SL cứng hoặc khung THÁNG chuyển kịch bản giảm. Chỉ Long."
     >
       {holding.length === 0 ? (
         <p className="sub">
@@ -5201,7 +5258,8 @@ function LiveDeskPanel({ rows, openStock }) {
                     {fmtPct(r.live.unrealizedPct)} ({r.live.unrealizedR.toFixed(2)}R)
                   </td>
                   <td style={{ color: CLR.mut, fontSize: 12 }}>
-                    {stateVN[r.live.cmtState] || r.live.cmtState} · Hurst {r.live.hurstPhase}
+                    {stateVN[r.live.cmtState] || r.live.cmtState}
+                    {r.live.partialDone && " · đã bán 50%, đang chạy tiếp"}
                   </td>
                   <td>
                     <button className="bt" onClick={() => openStock(r.key)}>
@@ -8047,17 +8105,17 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
           IN_RANGE: "Mua theo pullback ngày, tháng đang trong biên",
         };
         const scenRows = Object.entries(cb.byScen).sort((a, b) => b[1].n - a[1].n);
-        const reasonVN = { tp: "chạm TP", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ", hurst_end: "Hurst hết xu hướng" };
+        const reasonVN = { tp: "chạm TP", tp_partial: "chạm TP (bán 50%)", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
         const stateVN2 = { RUN_UP: "breakout tháng", IN_RANGE: "trong biên tháng" };
         return (
           <Panel
-            mod="Hurst · Backtest theo luật CMT × Hurst"
+            mod="Hurst · Backtest theo luật CMT × Trend"
             title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
             sub={`Luật: (1) CMT xác định hướng + TP trên KHUNG THÁNG (tháng trước đã đóng) · (2) Hurst chọn bộ chỉ báo Trend/Range của ngày quyết định · (3) xuống khung ngày GOM lệnh mỗi khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R (không giới hạn số lần, giá vào tính trung bình). Cắt lỗ cứng ${Math.round(
               opts.stopPct * 100
             )}% trên giá vào TB, chỉ gom khi TP ≥ ${opts.minRR.toFixed(
               1
-            )}× khoảng cách SL; thoát toàn bộ khi chạm TP/SL/hỗ trợ tháng vỡ/Hurst hết xu hướng. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
+            )}× khoảng cách SL. Chạm TP: bán 50%, phần còn lại chạy tiếp tới khi dính SL hoặc khung tháng chuyển kịch bản giảm. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
           >
             <div
               style={{
@@ -8090,7 +8148,8 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                     {cb.live.unrealizedPct.toFixed(1)}% ({cb.live.unrealizedR.toFixed(2)}R)
                   </Chip>
                   <Chip cls="mut">
-                    Bối cảnh: {stateVN2[cb.live.cmtState] || cb.live.cmtState} · Hurst {cb.live.hurstPhase}
+                    Bối cảnh: {stateVN2[cb.live.cmtState] || cb.live.cmtState}
+                    {cb.live.partialDone && " · đã bán 50%, đang chạy tiếp"}
                   </Chip>
                 </>
               ) : (
