@@ -3493,6 +3493,27 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   const timeoutMinR = opts.timeoutMinR != null ? opts.timeoutMinR : 0.5;
   const start = Math.max(300, 210);
 
+  // Mô phỏng ALL-IN chạy SONG SONG — để so sánh CÔNG BẰNG với Mua & Giữ.
+  // Bản "rủi ro cố định %/lệnh" (simulateEquityDaily) chỉ phơi ~10–20% vốn
+  // mỗi lệnh và không lãi kép, trong khi Mua & Giữ dồn 100% vốn từ đầu và
+  // lãi kép — hai thước vốn lệch nhau cả chục lần nên KHÔNG so tuyệt đối
+  // với nhau được. Bản all-in dùng CÙNG đơn vị với Mua & Giữ: có tín hiệu
+  // = dồn 100% vốn hiện có vào cổ phiếu (sau khi chốt 50% thì còn 50% cổ
+  // phiếu + 50% tiền mặt; tái vũ trang thì dồn lại đủ 100%), không có vị
+  // thế = 100% tiền mặt (lãi 0). Lãi kép trên vốn hiện có.
+  let aiEquity = 1,
+    aiPeak = 1,
+    aiMaxDD = 0;
+  const aiDaily = Array(n).fill(0);
+  const aiBook = (r, i) => {
+    if (!r || !isFinite(r)) return;
+    aiDaily[i] += r;
+    aiEquity *= 1 + r;
+    if (aiEquity > aiPeak) aiPeak = aiEquity;
+    const dd = (aiEquity - aiPeak) / aiPeak;
+    if (dd < aiMaxDD) aiMaxDD = dd;
+  };
+
   // Ghi toàn bộ fragment rủi ro của vị thế hiện tại tại một mốc thoát/chốt.
   const bookExit = (exitIdx, exitPrice, stoppedOut, reason) => {
     for (const lot of pos.lots) {
@@ -3556,6 +3577,18 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       const refSl = pos.lots[0].slDist;
       const timeoutHit =
         i - pos.i0 >= maxHold && (c - pos.avgEntry) / refSl < timeoutMinR;
+      const tpHit =
+        !(hitSL || flipDown || wflip || timeoutHit) &&
+        pos.tp != null &&
+        hi >= pos.tp;
+
+      // ALL-IN: ghi nhận biến động phiên i theo đúng tỷ trọng đang nắm
+      // (1 = full; 0.5 = sau khi đã chốt một nửa) và đúng giá thoát nếu có.
+      {
+        const frac = pos.partialDone ? 0.5 : 1;
+        const dayPx = hitSL ? pos.stop : tpHit ? pos.tp : c;
+        aiBook((dayPx / closes[i - 1] - 1) * frac, i);
+      }
 
       if (hitSL || flipDown || wflip || timeoutHit) {
         const exit = hitSL ? pos.stop : c;
@@ -3569,7 +3602,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
         bookExit(i, exit, hitSL || flipDown || wflip, reason);
         pos = null;
         justExited = true;
-      } else if (pos.tp != null && hi >= pos.tp) {
+      } else if (tpHit) {
         // Chạm TP tháng: ghi nhận rủi ro ĐẦY ĐỦ theo weight từng lot (từ
         // đúng ngày gom tới hôm nay — đúng quy mô vị thế thật lúc chốt),
         // rồi giữ lại 50% TỔNG vị thế chạy tiếp theo trailing tuần
@@ -3632,6 +3665,8 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
         partialDone: false,
         lastTakenTarget: null,
       };
+      // ALL-IN: vốn vào tại giá closes[i-1] — tính luôn biến động phiên i.
+      aiBook(closes[i] / entry - 1, i);
     } else {
       // GOM THÊM: rủi ro lot mới đo tới stop HIỆN HÀNH (đã trailing) —
       // KHÔNG tính lại stop theo giá vào trung bình. Stop sát giá hoặc
@@ -3639,6 +3674,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       const slDist = entry - pos.stop;
       if (slDist < entry * MIN_SL_PCT) continue;
       if (target - entry < slDist * minRR) continue;
+      const wasPartial = pos.partialDone;
       pos.lots.push({ idx: i, price: entry, slDist, w: 1 });
       pos.addCount++;
       const totW = pos.lots.reduce((s, l) => s + l.w, 0);
@@ -3647,6 +3683,9 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       pos.tp = target; // cập nhật theo target tháng mới nhất
       pos.state = state;
       if (pos.partialDone) pos.partialDone = false; // tái vũ trang — bậc TP mới
+      // ALL-IN: nửa tiền mặt (sau lần chốt 50%) được dồn lại vào tại
+      // closes[i-1] — ghi nhận biến động phiên i của phần tái triển khai.
+      if (wasPartial) aiBook((closes[i] / entry - 1) * 0.5, i);
     }
   }
 
@@ -3689,13 +3728,24 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     };
   }
 
-  return { trades, live, start, warmupFromDate: dates[start] };
+  return {
+    trades,
+    live,
+    start,
+    warmupFromDate: dates[start],
+    allIn: {
+      dailyReturns: aiDaily,
+      finalMultiple: aiEquity,
+      totalReturnPct: (aiEquity - 1) * 100,
+      maxDDPct: aiMaxDD * 100,
+    },
+  };
 }
 
 // Gói thống kê đầy đủ (tradeStats/winLoss/equity/theo đoạn/theo trạng thái
 // CMT lúc vào/Buy&Hold/live) từ danh sách lệnh thô của runCMTHurstLongRule.
 function summarizeRuleBacktest(engine, closes, dates, opts) {
-  const { trades, live, start } = engine;
+  const { trades, live, start, allIn } = engine;
   const n = closes.length;
   const sim = simulateEquityDaily(trades, closes, n, opts.riskPct);
   let cum = 0;
@@ -3704,6 +3754,14 @@ function summarizeRuleBacktest(engine, closes, dates, opts) {
     cum += sim.dailyReturns[i];
     equity.push({ d: dates[i], cum: cum * 100 });
   }
+  // Đường vốn ALL-IN (lãi kép) — CÙNG đơn vị đo với Mua & Giữ
+  let cumAI = 1;
+  const equityAllIn = [];
+  for (let i = start; i < n; i++) {
+    cumAI *= 1 + allIn.dailyReturns[i];
+    equityAllIn.push({ d: dates[i], cum: (cumAI - 1) * 100 });
+  }
+  const allInStats = seriesStats(allIn.dailyReturns.slice(start));
   const folds = Math.max(2, opts.wfFolds);
   const bnd = Array.from({ length: folds + 1 }, (_, k) =>
     Math.floor(((n - start) * k) / folds) + start
@@ -3744,6 +3802,13 @@ function summarizeRuleBacktest(engine, closes, dates, opts) {
     oosFromDate: dates[start],
     allCount: trades.length,
     buyHold: buyHoldEquity(closes, dates, start),
+    allIn: {
+      equity: equityAllIn,
+      totalReturnPct: (cumAI - 1) * 100,
+      maxDDPct: allIn.maxDDPct,
+      sharpe: allInStats.sharpe,
+      pctInMarket: allInStats.pctInMarket,
+    },
     live,
   };
 }
@@ -8253,7 +8318,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
             title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
             sub={`Luật v2 — tối ưu giữ sóng dài: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN — High chạy dồn từ đầu tháng phá kháng cự tháng trước đã đóng (không chờ đóng cửa cả tháng) · (2) đồng thuận Trend khung TUẦN còn dương mới gom · (3) gom khung ngày khi đồng thuận mua + giá vừa giảm + TP ≥ ${opts.minRR.toFixed(
               1
-            )}× khoảng cách SL. SL ban đầu = pivot đáy NGÀY; sau đó TRAILING lên đáy pivot TUẦN (chỉ nâng, không hạ — nhịp chỉnh ngày không đá lệnh ra giữa sóng). Chạm TP: chốt 50%, phần còn lại chạy theo trailing và TÁI VŨ TRANG khi có bậc target tháng mới cao hơn. Thoát hết khi: dính trailing SL / vỡ hỗ trợ tháng / xu hướng tuần ≤ ${opts.weekExitThr} hai tuần liên tiếp / quá ${opts.cardMaxHold} phiên mà lãi < ${opts.timeoutMinR}R. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lần gom. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
+            )}× khoảng cách SL. SL ban đầu = pivot đáy NGÀY; sau đó TRAILING lên đáy pivot TUẦN (chỉ nâng, không hạ — nhịp chỉnh ngày không đá lệnh ra giữa sóng). Chạm TP: chốt 50%, phần còn lại chạy theo trailing và TÁI VŨ TRANG khi có bậc target tháng mới cao hơn. Thoát hết khi: dính trailing SL / vỡ hỗ trợ tháng / xu hướng tuần ≤ ${opts.weekExitThr} hai tuần liên tiếp / quá ${opts.cardMaxHold} phiên mà lãi < ${opts.timeoutMinR}R. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lần gom. Mô phỏng nhân quả từ ${cb.oosFromDate}. HAI THƯỚC VỐN: "dồn toàn bộ vốn" (all-in, lãi kép, 100% vốn khi có tín hiệu) là thước DUY NHẤT so tuyệt đối được với Mua & Giữ; "rủi ro cố định %/lệnh" chỉ phơi ~10–20% vốn mỗi lệnh và không lãi kép — dùng để đo chất lượng tín hiệu theo R, không phải để so với Mua & Giữ.`}
           >
             <div
               style={{
@@ -8314,33 +8379,44 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
               <>
                 <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
                   <MetricBox
-                    label="Tổng lợi nhuận OOS"
+                    label="DỒN TOÀN BỘ VỐN (all-in, lãi kép)"
+                    value={`${cb.allIn.totalReturnPct >= 0 ? "+" : ""}${cb.allIn.totalReturnPct.toFixed(1)}%`}
+                    color={cb.allIn.totalReturnPct >= 0 ? CLR.bull : CLR.bear}
+                    sub={`${fmtMoney(capital.value * (1 + cb.allIn.totalReturnPct / 100))} · MaxDD ${cb.allIn.maxDDPct.toFixed(1)}% · trong thị trường ${isFinite(cb.allIn.pctInMarket) ? cb.allIn.pctInMarket.toFixed(0) : "—"}% thời gian`}
+                  />
+                  <MetricBox
+                    label="ALL-IN so với Mua & Giữ (cùng thước vốn)"
+                    value={`${cb.allIn.totalReturnPct - cb.buyHold.totalReturnPct >= 0 ? "+" : ""}${(
+                      cb.allIn.totalReturnPct - cb.buyHold.totalReturnPct
+                    ).toFixed(1)}%`}
+                    color={cb.allIn.totalReturnPct >= cb.buyHold.totalReturnPct ? CLR.bull : CLR.bear}
+                    sub={`Mua & Giữ: ${cb.buyHold.totalReturnPct >= 0 ? "+" : ""}${cb.buyHold.totalReturnPct.toFixed(1)}% · MaxDD ${cb.buyHold.maxDDPct.toFixed(1)}%`}
+                  />
+                  <MetricBox
+                    label={`Rủi ro cố định ${riskPctIn.value}%/lệnh (đo chất lượng tín hiệu)`}
                     value={s.blown ? "⚠ Cháy TK" : `${s.totalReturnPct >= 0 ? "+" : ""}${s.totalReturnPct.toFixed(1)}%`}
                     color={s.totalReturnPct >= 0 ? CLR.bull : CLR.bear}
-                    sub={s.blown ? "" : fmtMoney(capital.value * s.finalMultiple)}
+                    sub="phơi ~10–20% vốn/lệnh, không lãi kép — KHÔNG so tuyệt đối với Mua & Giữ"
                   />
                   <MetricBox label="Số lần gom" value={ts.count} sub={`mỗi lần gom tính rủi ro riêng · giữ TB ${ts.avgHoldDays ? ts.avgHoldDays.toFixed(1) : "—"} phiên`} />
                   <MetricBox label="Tỷ lệ thắng" value={isFinite(ts.hitRate) ? ts.hitRate.toFixed(0) + "%" : "—"} />
                   <MetricBox label="Sharpe (theo lệnh)" value={isFinite(ts.sharpe) ? ts.sharpe.toFixed(2) : "—"} />
-                  <MetricBox label="Max Drawdown" value={`${s.maxDDPct.toFixed(1)}%`} color={CLR.bear} />
-                  <MetricBox
-                    label="So với Mua & Giữ"
-                    value={`${s.totalReturnPct - cb.buyHold.totalReturnPct >= 0 ? "+" : ""}${(
-                      s.totalReturnPct - cb.buyHold.totalReturnPct
-                    ).toFixed(1)}%`}
-                    color={s.totalReturnPct >= cb.buyHold.totalReturnPct ? CLR.bull : CLR.bear}
-                    sub={`Mua & Giữ cùng kỳ: ${cb.buyHold.totalReturnPct >= 0 ? "+" : ""}${cb.buyHold.totalReturnPct.toFixed(1)}%`}
-                  />
+                  <MetricBox label="MaxDD (bản rủi ro cố định)" value={`${s.maxDDPct.toFixed(1)}%`} color={CLR.bear} />
                 </div>
                 <div className="sub" style={{ marginBottom: 4 }}>
-                  Đường vốn (OOS, walk-forward causal) — nét liền là chiến
-                  lược, nét đứt là chỉ mua & giữ
+                  Đường vốn (OOS, walk-forward causal) — xanh liền = chiến lược
+                  DỒN TOÀN BỘ VỐN (cùng thước với Mua & Giữ) · xám đứt = Mua &
+                  Giữ · xanh mảnh = bản rủi ro cố định %/lệnh (chỉ tham chiếu)
                 </div>
-                <div style={{ width: "100%", height: 150 }}>
+                <div style={{ width: "100%", height: 170 }}>
                   <ResponsiveContainer>
                     <LineChart
                       data={(() => {
                         const byD = {};
+                        cb.allIn.equity.forEach((e) => {
+                          (byD[e.d] = byD[e.d] || { d: e.d }).ai =
+                            capital.value * (1 + e.cum / 100);
+                        });
                         cb.equity.forEach((e) => {
                           (byD[e.d] = byD[e.d] || { d: e.d }).strat =
                             capital.value * (1 + e.cum / 100);
@@ -8353,12 +8429,13 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                       })()}
                       margin={{ top: 4, right: 6, bottom: 0, left: 0 }}
                     >
-                      <Line dataKey="strat" name="Chiến lược" stroke={CLR.blue} dot={false} strokeWidth={1.8} isAnimationActive={false} connectNulls />
+                      <Line dataKey="ai" name="Chiến lược (all-in)" stroke={CLR.bull} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls />
                       <Line dataKey="bh" name="Mua & Giữ" stroke="#9aa5c0" strokeDasharray="5 4" dot={false} strokeWidth={1.4} isAnimationActive={false} connectNulls />
+                      <Line dataKey="strat" name="Rủi ro cố định %/lệnh" stroke={CLR.blue} strokeOpacity={0.55} dot={false} strokeWidth={1} isAnimationActive={false} connectNulls />
                       <XAxis dataKey="d" hide />
                       <YAxis hide domain={["auto", "auto"]} />
                       <ReferenceLine y={capital.value} stroke={CLR.line} label={{ value: "vốn gốc", fill: CLR.mut, fontSize: 10, position: "insideBottomLeft" }} />
-                      <Tooltip contentStyle={TT} formatter={(v, nm) => [fmtMoney(v), nm === "strat" ? "Chiến lược" : "Mua & Giữ"]} labelStyle={{ color: CLR.blue }} />
+                      <Tooltip contentStyle={TT} formatter={(v, nm) => [fmtMoney(v), nm === "ai" ? "Chiến lược (all-in)" : nm === "bh" ? "Mua & Giữ" : "Rủi ro cố định %/lệnh"]} labelStyle={{ color: CLR.blue }} />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
