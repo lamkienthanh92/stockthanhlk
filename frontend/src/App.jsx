@@ -3409,41 +3409,38 @@ function netAtDefs(defs, i) {
 }
 
 // ============================================================
-// LUẬT GIAO DỊCH CMT × TREND (v2 — tối ưu giữ SÓNG DÀI)
-// Nguyên tắc: "target khung nào, trailing khung đó". Dùng chung cho
-// backtest lịch sử VÀ trạng thái "đang sống" trên Bộ lọc. Hoàn toàn nhân
-// quả (không nhìn trước), chỉ Long (TTCK VN không bán khống):
+// LUẬT GIAO DỊCH CMT × TREND (v3 — trend-following thuần cho thị trường
+// tăng trường kỳ). Dùng chung cho backtest lịch sử VÀ trạng thái "đang
+// sống" trên Bộ lọc. Hoàn toàn nhân quả (không nhìn trước), chỉ Long:
 //
-//  VÀO LỆNH (giữ như v1 — điểm mạnh là entry tinh):
+//  BÀI HỌC TỪ v2 (backtest FPT/HPG/VPB): thua Mua & Giữ chủ yếu vì chỉ ở
+//  trong thị trường 22–40% thời gian — thủ phạm là điều kiện "target tháng
+//  còn phía trên giá" (trong uptrend dốc giá vượt measured-move rất sớm →
+//  bị quét SL xong KHÔNG được vào lại) và TP tháng chốt non giữa sóng.
+//
+//  VÀO LỆNH:
 //  (1) CMT tháng phải RUN_UP — High chạy dồn từ đầu tháng hiện tại phá
-//      kháng cự tháng trước đã đóng; TP = target tháng (R + 0.618×(R−S)).
+//      kháng cự tháng trước đã đóng. KHÔNG còn chặn theo target tháng.
 //  (2) Xác nhận tuần: đồng thuận 22 chỉ báo Trend của tuần trước đã đóng
 //      phải >0 mới được gom.
 //  (3) Gom khung ngày (DCA/pyramid): đồng thuận Trend ngày > ngưỡng + giá
-//      vừa giảm + TP còn gấp đủ minRR lần rủi ro. SL BAN ĐẦU = pivot đáy
-//      NGÀY gần nhất dưới giá vào (rủi ro chặt lúc mở lệnh).
+//      vừa giảm. SL BAN ĐẦU = pivot đáy NGÀY gần nhất dưới giá vào.
+//      → Bị quét giữa uptrend thì phiên pullback kế tiếp vào lại được ngay.
 //
-//  QUẢN LÝ LỆNH (khác v1 — đây là phần sửa để không cắt sóng):
-//  • TRAILING RATCHET: stop được nâng dần lên ĐÁY PIVOT TUẦN đã xác nhận
-//    gần nhất dưới giá — chỉ nâng, KHÔNG bao giờ hạ, và KHÔNG phụ thuộc
-//    giá vào trung bình. Nhịp chỉnh khung ngày không còn quét sạch vị thế
-//    giữa sóng; lệnh chỉ thoát khi cấu trúc Dow của TUẦN gãy.
-//  • Chạm TP tháng: chốt 50% tổng vị thế, phần còn lại chạy theo trailing.
-//    Khi tháng sau breakout tiếp và sinh target CAO HƠN mức đã chốt →
-//    TÁI VŨ TRANG: được gom lại và có bậc TP mới (vị thế "thở" theo từng
-//    bậc thang của sóng thay vì teo dần rồi tắt).
+//  QUẢN LÝ LỆNH:
+//  • TRAILING RATCHET: stop nâng dần lên ĐÁY PIVOT TUẦN đã xác nhận gần
+//    nhất dưới giá — chỉ nâng, KHÔNG hạ, KHÔNG phụ thuộc giá vào trung
+//    bình. Lệnh chỉ thoát khi cấu trúc Dow của TUẦN gãy.
+//  • Chốt 50% MỘT LẦN tại +tpR×R (rủi ro ban đầu, mặc định +3R) — thay
+//    cho TP tháng. Phần còn lại + mọi lần gom sau chạy TRAILING THUẦN,
+//    không còn TP: sóng dài được giữ tới khi cấu trúc gãy.
 //  • Timeout CHỈ áp cho lệnh không chạy: quá maxHold phiên mà lãi chưa đạt
 //    timeoutMinR ×R thì mới đuổi ra — lệnh đang lãi rõ giữ vô thời hạn.
 //  • Thoát hết khi: dính trailing SL, HOẶC giá đóng dưới hỗ trợ tháng
 //    trước (flip), HOẶC đồng thuận Trend tuần < weekExitThr HAI tuần đã
-//    đóng liên tiếp (wflip — bắt đảo chiều sớm hơn hỗ trợ tháng nhưng
-//    không nhạy tới mức nhiễu một tuần đỏ).
-//  • Khi gom thêm, rủi ro lot mới đo tới stop HIỆN HÀNH (đã trailing) —
-//    stop kéo lên gần giá + target còn ít thì R:R tự rớt dưới minRR và hệ
-//    thống ngừng gom: phanh chống mua đuổi cuối sóng có sẵn trong luật.
-//  • Hạch toán R theo slDistance BAN ĐẦU của từng lot (đúng quy mô đã
-//    sizing lúc mở); sàn slDist 2% giá để tránh sizing phình to bất thường
-//    khi pivot/stop nằm quá sát giá.
+//    đóng liên tiếp (wflip).
+//  • Hạch toán R theo slDistance BAN ĐẦU của từng lot; sàn slDist 2% giá
+//    để tránh sizing phình to khi pivot/stop nằm quá sát giá.
 // ============================================================
 const ENTRY_CONSENSUS_THR = 0.2;
 const MIN_SL_PCT = 0.02; // sàn khoảng cách SL = 2% giá vào (chống sizing phình to)
@@ -3488,7 +3485,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   let pos = null;
   const maxHold = opts.cardMaxHold || 120;
   const stopPct = opts.stopPct || 0.1;
-  const minRR = opts.minRR || 1.0;
+  const tpR = opts.tpR != null ? opts.tpR : 3; // chốt 50% một lần tại +tpR×R
   const wExitThr = opts.weekExitThr != null ? opts.weekExitThr : -0.3;
   const timeoutMinR = opts.timeoutMinR != null ? opts.timeoutMinR : 0.5;
   const start = Math.max(300, 210);
@@ -3614,7 +3611,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
         ];
         pos.avgEntry = pos.tp;
         pos.lastTakenTarget = pos.tp;
-        pos.tp = null; // chờ target tháng MỚI cao hơn để tái vũ trang
+        pos.tp = null; // v3: hết TP — phần còn lại trailing thuần tới khi cấu trúc gãy
         pos.partialDone = true;
       }
     }
@@ -3624,17 +3621,15 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     const j = i - 1;
     const lastC = closes[j];
 
-    // (1) CMT khung THÁNG: chỉ vào/gom khi ĐÃ BREAKOUT LÊN và target còn
-    // phía trên giá — bỏ hẳn kịch bản "trong biên" (backtest cho thấy
-    // trong biên thua lỗ nặng ở hầu hết mã VN30).
+    // (1) CMT khung THÁNG: chỉ vào/gom khi ĐÃ BREAKOUT LÊN. v3: BỎ điều
+    // kiện "target tháng còn phía trên giá" — chính nó là thứ khoá hệ
+    // thống đứng ngoài đúng lúc sóng chạy mạnh nhất (trong uptrend dốc,
+    // giá vượt measured-move của biên tháng trước rất sớm → sau khi bị
+    // quét SL không được phép vào lại, exposure tụt còn 20–40% thời gian
+    // trong khi thị trường tăng trường kỳ). Target tháng giờ chỉ còn là
+    // tham chiếu hiển thị; TP của luật tính theo bội số R bên dưới.
     const state = mCMT.dayState[j];
-    const target = mCMT.dayTarget[j];
-    if (state !== "RUN_UP" || target == null || target <= lastC) continue;
-
-    // Sau khi đã chốt 50%: chỉ TÁI VŨ TRANG khi target tháng MỚI cao hơn
-    // mức đã chốt — bậc thang theo sóng, không mua lại cùng một bậc.
-    if (pos && pos.partialDone && target <= pos.lastTakenTarget * 1.001)
-      continue;
+    if (state !== "RUN_UP") continue;
 
     // (2) Xác nhận tuần: đồng thuận tuần trước phải còn dương mới gom
     const wIdx = wGate.dayWeekIdx[j] - 1;
@@ -3653,13 +3648,15 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       const stopLevel = pivotLow != null ? pivotLow : entry * (1 - stopPct);
       const slDist = entry - stopLevel;
       if (slDist < entry * MIN_SL_PCT) continue; // stop quá sát → bỏ qua
-      if (target - entry < slDist * minRR) continue;
       pos = {
         i0: i,
         lots: [{ idx: i, price: entry, slDist, w: 1 }],
         avgEntry: entry,
         stop: stopLevel,
-        tp: target,
+        // v3: chốt 50% MỘT LẦN tại +tpR×R (theo rủi ro ban đầu) — không
+        // dùng target tháng nữa vì nó teo lại theo biên tháng trước và
+        // cắt non đúng giữa sóng dài.
+        tp: entry + tpR * slDist,
         state,
         addCount: 1,
         partialDone: false,
@@ -3669,20 +3666,21 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
       aiBook(closes[i] / entry - 1, i);
     } else {
       // GOM THÊM: rủi ro lot mới đo tới stop HIỆN HÀNH (đã trailing) —
-      // KHÔNG tính lại stop theo giá vào trung bình. Stop sát giá hoặc
-      // target còn ít → R:R rớt dưới minRR → tự động không gom.
+      // KHÔNG tính lại stop theo giá vào trung bình. v3: không còn chặn
+      // theo target tháng — chỉ cần RUN_UP + tuần dương + pullback ngày.
       const slDist = entry - pos.stop;
       if (slDist < entry * MIN_SL_PCT) continue;
-      if (target - entry < slDist * minRR) continue;
       const wasPartial = pos.partialDone;
       pos.lots.push({ idx: i, price: entry, slDist, w: 1 });
       pos.addCount++;
       const totW = pos.lots.reduce((s, l) => s + l.w, 0);
       pos.avgEntry =
         pos.lots.reduce((s, l) => s + l.price * l.w, 0) / totW;
-      pos.tp = target; // cập nhật theo target tháng mới nhất
+      // v3: KHÔNG đặt lại TP khi gom — đã chốt 50% một lần rồi thì phần
+      // còn lại (kể cả các lần gom sau) chạy TRAILING THUẦN tới khi cấu
+      // trúc gãy; chưa chốt lần nào thì giữ nguyên TP theo R của lot đầu.
       pos.state = state;
-      if (pos.partialDone) pos.partialDone = false; // tái vũ trang — bậc TP mới
+      if (pos.partialDone) pos.partialDone = false; // tái vũ trang bằng nửa tiền mặt
       // ALL-IN: nửa tiền mặt (sau lần chốt 50%) được dồn lại vào tại
       // closes[i-1] — ghi nhận biến động phiên i của phần tái triển khai.
       if (wasPartial) aiBook((closes[i] / entry - 1) * 0.5, i);
@@ -5365,11 +5363,11 @@ function LiveDeskPanel({ rows, openStock }) {
   const fmtPct = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
   return (
     <Panel
-      mod="Bàn lệnh · Luật CMT × Trend v2"
+      mod="Bàn lệnh · Luật CMT × Trend v3"
       title={`Đang giữ ${holding.length} mã${
         openedToday.length ? ` · mở mới hôm nay ${openedToday.length}` : ""
       }${closedToday.length ? ` · đóng hôm nay ${closedToday.length}` : ""}`}
-      sub="Luật v2 — tối ưu giữ sóng dài: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN — High chạy dồn từ đầu tháng phá kháng cự tháng trước đã đóng · (2) đồng thuận Trend khung TUẦN còn dương mới được gom · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R. SL ban đầu = pivot đáy NGÀY; sau đó TRAILING lên đáy pivot TUẦN (chỉ nâng, không hạ) — nhịp chỉnh ngày không còn đá lệnh ra giữa sóng. Chạm TP: chốt 50%, phần còn lại chạy theo trailing và TÁI VŨ TRANG khi có bậc target tháng mới cao hơn. Thoát hết khi: dính trailing SL / vỡ hỗ trợ tháng / xu hướng tuần âm 2 tuần liên tiếp / timeout chỉ áp cho lệnh không chạy. Chỉ Long."
+      sub="Luật v3 — trend-following thuần cho thị trường tăng trường kỳ: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN — High chạy dồn từ đầu tháng phá kháng cự tháng trước đã đóng; KHÔNG còn chặn khi giá vượt target tháng, bị quét SL giữa uptrend thì phiên pullback kế tiếp vào lại được ngay · (2) đồng thuận Trend khung TUẦN còn dương mới được gom · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm. SL ban đầu = pivot đáy NGÀY; sau đó TRAILING lên đáy pivot TUẦN (chỉ nâng, không hạ). Chốt 50% MỘT LẦN theo bội số R (mặc định +3R, chỉnh ở tab Hurst); phần còn lại + mọi lần gom sau chạy TRAILING THUẦN tới khi cấu trúc gãy (trailing SL / vỡ hỗ trợ tháng / tuần âm 2 tuần liên tiếp / timeout chỉ áp cho lệnh không chạy). Chỉ Long."
     >
       {holding.length === 0 ? (
         <p className="sub">
@@ -5419,7 +5417,7 @@ function LiveDeskPanel({ rows, openStock }) {
                     {r.live.stop.toLocaleString("vi-VN")}
                   </td>
                   <td className="num" style={{ color: CLR.bull }}>
-                    {r.live.tp != null ? r.live.tp.toLocaleString("vi-VN") : "đã chốt 50% — trailing, chờ bậc TP mới"}
+                    {r.live.tp != null ? r.live.tp.toLocaleString("vi-VN") : "đã chốt 50% — phần còn lại trailing thuần"}
                   </td>
                   <td
                     className="num"
@@ -5432,7 +5430,7 @@ function LiveDeskPanel({ rows, openStock }) {
                   </td>
                   <td style={{ color: CLR.mut, fontSize: 12 }}>
                     {stateVN[r.live.cmtState] || r.live.cmtState}
-                    {r.live.partialDone && " · đã chốt 50%, trailing chờ bậc mới"}
+                    {r.live.partialDone && " · đã chốt 50%, phần còn lại trailing thuần"}
                   </td>
                   <td>
                     <button className="bt" onClick={() => openStock(r.key)}>
@@ -8003,16 +8001,19 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
             />
           </div>
           <div>
-            <label className="lb">R:R tối thiểu — luật CMT×Hurst</label>
+            <label className="lb">Chốt 50% tại (+R) — luật CMT</label>
             <input
               className="inp"
               style={{ width: 80 }}
               type="number"
-              step="0.1"
-              min="0.5"
-              max="5"
-              value={opts.minRR}
-              onChange={(e) => setOpt("minRR", Math.max(0.5, Math.min(5, +e.target.value || 1.0)))}
+              step="0.5"
+              min="1"
+              max="10"
+              value={opts.tpR}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setOpt("tpR", isNaN(v) ? 3 : Math.max(1, Math.min(10, v)));
+              }}
             />
           </div>
           <div>
@@ -8314,11 +8315,9 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
         const stateVN2 = { RUN_UP: "breakout tháng", IN_RANGE: "trong biên tháng" };
         return (
           <Panel
-            mod="Hurst · Backtest theo luật CMT × Trend v2"
+            mod="Hurst · Backtest theo luật CMT × Trend v3"
             title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
-            sub={`Luật v2 — tối ưu giữ sóng dài: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN — High chạy dồn từ đầu tháng phá kháng cự tháng trước đã đóng (không chờ đóng cửa cả tháng) · (2) đồng thuận Trend khung TUẦN còn dương mới gom · (3) gom khung ngày khi đồng thuận mua + giá vừa giảm + TP ≥ ${opts.minRR.toFixed(
-              1
-            )}× khoảng cách SL. SL ban đầu = pivot đáy NGÀY; sau đó TRAILING lên đáy pivot TUẦN (chỉ nâng, không hạ — nhịp chỉnh ngày không đá lệnh ra giữa sóng). Chạm TP: chốt 50%, phần còn lại chạy theo trailing và TÁI VŨ TRANG khi có bậc target tháng mới cao hơn. Thoát hết khi: dính trailing SL / vỡ hỗ trợ tháng / xu hướng tuần ≤ ${opts.weekExitThr} hai tuần liên tiếp / quá ${opts.cardMaxHold} phiên mà lãi < ${opts.timeoutMinR}R. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lần gom. Mô phỏng nhân quả từ ${cb.oosFromDate}. HAI THƯỚC VỐN: "dồn toàn bộ vốn" (all-in, lãi kép, 100% vốn khi có tín hiệu) là thước DUY NHẤT so tuyệt đối được với Mua & Giữ; "rủi ro cố định %/lệnh" chỉ phơi ~10–20% vốn mỗi lệnh và không lãi kép — dùng để đo chất lượng tín hiệu theo R, không phải để so với Mua & Giữ.`}
+            sub={`Luật v3 — trend-following thuần cho thị trường tăng trường kỳ: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN — High chạy dồn từ đầu tháng phá kháng cự tháng trước đã đóng; KHÔNG còn chặn khi giá vượt target tháng (nguyên nhân v2 đứng ngoài 60–78% thời gian) — bị quét SL giữa uptrend thì phiên pullback kế tiếp vào lại được ngay · (2) đồng thuận Trend khung TUẦN còn dương mới gom · (3) gom khung ngày khi đồng thuận mua + giá vừa giảm. SL ban đầu = pivot đáy NGÀY; sau đó TRAILING lên đáy pivot TUẦN (chỉ nâng, không hạ). Chốt 50% MỘT LẦN tại +${(opts.tpR != null ? opts.tpR : 3).toFixed(1)}R; phần còn lại + mọi lần gom sau chạy TRAILING THUẦN — không còn TP, sóng dài giữ tới khi cấu trúc gãy. Thoát hết khi: dính trailing SL / vỡ hỗ trợ tháng / xu hướng tuần ≤ ${opts.weekExitThr} hai tuần liên tiếp / quá ${opts.cardMaxHold} phiên mà lãi < ${opts.timeoutMinR}R. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lần gom. Mô phỏng nhân quả từ ${cb.oosFromDate}. HAI THƯỚC VỐN: "dồn toàn bộ vốn" (all-in, lãi kép, 100% vốn khi có tín hiệu) là thước DUY NHẤT so tuyệt đối được với Mua & Giữ; "rủi ro cố định %/lệnh" chỉ phơi ~10–20% vốn mỗi lệnh và không lãi kép — dùng để đo chất lượng tín hiệu theo R, không phải để so với Mua & Giữ.`}
           >
             <div
               style={{
@@ -8344,7 +8343,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                   <Chip cls="mut">
                     Vào TB {cb.live.entryPrice.toLocaleString("vi-VN")} · SL trailing{" "}
                     {cb.live.stop.toLocaleString("vi-VN")} · TP{" "}
-                    {cb.live.tp != null ? cb.live.tp.toLocaleString("vi-VN") : "đã chốt 50% — trailing, chờ bậc TP mới"}
+                    {cb.live.tp != null ? cb.live.tp.toLocaleString("vi-VN") : "đã chốt 50% — phần còn lại trailing thuần"}
                   </Chip>
                   <Chip cls={cb.live.unrealizedPct >= 0 ? "up" : "down"}>
                     Tạm tính {cb.live.unrealizedPct >= 0 ? "+" : ""}
@@ -8352,7 +8351,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                   </Chip>
                   <Chip cls="mut">
                     Bối cảnh: {stateVN2[cb.live.cmtState] || cb.live.cmtState}
-                    {cb.live.partialDone && " · đã chốt 50%, trailing chờ bậc mới"}
+                    {cb.live.partialDone && " · đã chốt 50%, phần còn lại trailing thuần"}
                   </Chip>
                 </>
               ) : (
@@ -8750,6 +8749,7 @@ export default function App() {
     slMult: 2,
     stopPct: 0.1,
     minRR: 1.0,
+    tpR: 3,
     minTrendStrength: 0,
     minPullbackATR: 0,
     rangeEnterThr: 0.2,
@@ -8795,6 +8795,7 @@ export default function App() {
       slMult: opts.slMult,
       stopPct: opts.stopPct,
       minRR: opts.minRR,
+      tpR: opts.tpR,
       riskPct: Math.max(0.1, riskPctIn) / 100,
       hurstWin: opts.hurstWin,
       hurstStep: opts.hurstStep,
@@ -8802,7 +8803,7 @@ export default function App() {
       weekExitThr: opts.weekExitThr,
       timeoutMinR: opts.timeoutMinR,
     }),
-    [opts.atrPeriod, opts.slMult, opts.stopPct, opts.minRR, riskPctIn, opts.hurstWin, opts.hurstStep, opts.cardMaxHold, opts.weekExitThr, opts.timeoutMinR]
+    [opts.atrPeriod, opts.slMult, opts.stopPct, opts.minRR, opts.tpR, riskPctIn, opts.hurstWin, opts.hurstStep, opts.cardMaxHold, opts.weekExitThr, opts.timeoutMinR]
   );
 
   const screener = useMemo(() => {
