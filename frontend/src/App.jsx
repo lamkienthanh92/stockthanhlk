@@ -15,6 +15,11 @@
 // khác forex OTC không có volume). Không dùng DXY/COT/session/lịch
 // kinh tế liên ngân hàng — những phần đó chỉ áp dụng cho forex.
 //
+// LUẬT GIAO DỊCH v2 — tối ưu giữ SÓNG DÀI: trailing stop bằng đáy pivot
+// TUẦN (chỉ nâng không hạ), chốt 50% tại TP tháng rồi TÁI VŨ TRANG khi
+// có bậc target mới cao hơn, timeout chỉ áp cho lệnh không chạy, thêm
+// van thoát khi xu hướng tuần gãy 2 tuần liên tiếp.
+//
 // Công cụ nghiên cứu — không phải khuyến nghị đầu tư.
 // ============================================================
 
@@ -3362,7 +3367,7 @@ function buildMonthlyCMT(closes, highs, lows, dates) {
 // đúng bộ 22 chỉ báo Trend (kể cả Volume) dùng ở tab Hurst, nhưng tính trên
 // KHUNG TUẦN thay vì để Hurst tự dò regime Trend/Range mỗi ngày. Dùng tuần
 // TRƯỚC đã đóng (nhân quả, không nhìn trước). Đồng thuận tuần quay ≤0 chỉ
-// NGỪNG GOM THÊM — không tự thoát lệnh (thoát hoàn toàn do khung THÁNG quyết).
+// NGỪNG GOM THÊM — không tự thoát lệnh (thoát do trailing/khung THÁNG quyết).
 function buildWeeklyTrendGate(closes, volumes, highs, lows, dates) {
   const n = closes.length;
   const H_ = highs || closes,
@@ -3404,31 +3409,44 @@ function netAtDefs(defs, i) {
 }
 
 // ============================================================
-// LUẬT GIAO DỊCH CMT × TREND — dùng chung cho backtest lịch sử VÀ trạng
-// thái "đang sống" hiển thị trên Bộ lọc. Hoàn toàn nhân quả (không nhìn
-// trước), chỉ Long (TTCK VN không bán khống, mặc định CK VN đang trong xu
-// hướng tăng dài hạn nên không còn phân biệt regime Trend/Range của Hurst):
+// LUẬT GIAO DỊCH CMT × TREND (v2 — tối ưu giữ SÓNG DÀI)
+// Nguyên tắc: "target khung nào, trailing khung đó". Dùng chung cho
+// backtest lịch sử VÀ trạng thái "đang sống" trên Bộ lọc. Hoàn toàn nhân
+// quả (không nhìn trước), chỉ Long (TTCK VN không bán khống):
 //
-//  (1) CMT xác định HƯỚNG + TP trên KHUNG THÁNG (tháng trước đã đóng) —
-//      CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN (TP = R + 0.618×(R−S)); bỏ hẳn
-//      kịch bản "trong biên" (backtest cho thấy trong biên thua lỗ nặng ở
-//      hầu hết mã VN30, trong khi breakout thắng đều đặn hơn nhiều).
-//      Tháng đi ngang hoặc breakout xuống: KHÔNG vào lệnh.
-//  (2) Xác nhận xu hướng KHUNG TUẦN bằng đúng bộ 22 chỉ báo Trend (kể cả
-//      Volume) — đồng thuận tuần (tuần trước đã đóng) phải còn dương mới
-//      được GOM THÊM; quay ≤0 chỉ ngừng gom, không tự thoát lệnh.
-//  (3) Xuống khung NGÀY để GOM lệnh (DCA/pyramid): mỗi lần bộ chỉ báo Trend
-//      ngày đang NGHIÊNG MUA (>ngưỡng) VÀ giá vừa giảm VÀ TP vẫn gấp đủ số
-//      lần rủi ro tối thiểu (R:R) — mua thêm, rủi ro % vốn như lần đầu,
-//      không giới hạn số lần. Giá vào TRUNG BÌNH cập nhật lại sau mỗi lần
-//      gom; SL = PIVOT ĐÁY NGÀY gần nhất phía dưới giá vào trung bình
-//      (không dùng % cố định hay ATR — dùng đúng đáy swing thật trên biểu
-//      đồ), lấy lại pivot mới sau mỗi lần gom.
-//      CHẠM TP: bán 50%, phần còn lại CHẠY TIẾP (ngừng gom thêm), không còn
-//      TP cho phần này nữa — chỉ thoát khi dính SL hoặc khung THÁNG chuyển
-//      hẳn sang kịch bản giảm (hỗ trợ tháng vỡ / state RUN_DOWN).
+//  VÀO LỆNH (giữ như v1 — điểm mạnh là entry tinh):
+//  (1) CMT tháng phải RUN_UP — High chạy dồn từ đầu tháng hiện tại phá
+//      kháng cự tháng trước đã đóng; TP = target tháng (R + 0.618×(R−S)).
+//  (2) Xác nhận tuần: đồng thuận 22 chỉ báo Trend của tuần trước đã đóng
+//      phải >0 mới được gom.
+//  (3) Gom khung ngày (DCA/pyramid): đồng thuận Trend ngày > ngưỡng + giá
+//      vừa giảm + TP còn gấp đủ minRR lần rủi ro. SL BAN ĐẦU = pivot đáy
+//      NGÀY gần nhất dưới giá vào (rủi ro chặt lúc mở lệnh).
+//
+//  QUẢN LÝ LỆNH (khác v1 — đây là phần sửa để không cắt sóng):
+//  • TRAILING RATCHET: stop được nâng dần lên ĐÁY PIVOT TUẦN đã xác nhận
+//    gần nhất dưới giá — chỉ nâng, KHÔNG bao giờ hạ, và KHÔNG phụ thuộc
+//    giá vào trung bình. Nhịp chỉnh khung ngày không còn quét sạch vị thế
+//    giữa sóng; lệnh chỉ thoát khi cấu trúc Dow của TUẦN gãy.
+//  • Chạm TP tháng: chốt 50% tổng vị thế, phần còn lại chạy theo trailing.
+//    Khi tháng sau breakout tiếp và sinh target CAO HƠN mức đã chốt →
+//    TÁI VŨ TRANG: được gom lại và có bậc TP mới (vị thế "thở" theo từng
+//    bậc thang của sóng thay vì teo dần rồi tắt).
+//  • Timeout CHỈ áp cho lệnh không chạy: quá maxHold phiên mà lãi chưa đạt
+//    timeoutMinR ×R thì mới đuổi ra — lệnh đang lãi rõ giữ vô thời hạn.
+//  • Thoát hết khi: dính trailing SL, HOẶC giá đóng dưới hỗ trợ tháng
+//    trước (flip), HOẶC đồng thuận Trend tuần < weekExitThr HAI tuần đã
+//    đóng liên tiếp (wflip — bắt đảo chiều sớm hơn hỗ trợ tháng nhưng
+//    không nhạy tới mức nhiễu một tuần đỏ).
+//  • Khi gom thêm, rủi ro lot mới đo tới stop HIỆN HÀNH (đã trailing) —
+//    stop kéo lên gần giá + target còn ít thì R:R tự rớt dưới minRR và hệ
+//    thống ngừng gom: phanh chống mua đuổi cuối sóng có sẵn trong luật.
+//  • Hạch toán R theo slDistance BAN ĐẦU của từng lot (đúng quy mô đã
+//    sizing lúc mở); sàn slDist 2% giá để tránh sizing phình to bất thường
+//    khi pivot/stop nằm quá sát giá.
 // ============================================================
 const ENTRY_CONSENSUS_THR = 0.2;
+const MIN_SL_PCT = 0.02; // sàn khoảng cách SL = 2% giá vào (chống sizing phình to)
 
 function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   const n = closes.length;
@@ -3438,137 +3456,133 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   // (1) CMT khung THÁNG — hướng, R/S, target cho toàn bộ lịch sử một lần
   const mCMT = buildMonthlyCMT(closes, highs, lows, dates);
 
-  // (2) Xác nhận xu hướng khung TUẦN — thay cho việc Hurst dò regime hàng ngày
+  // (2) Xác nhận xu hướng khung TUẦN
   const wGate = buildWeeklyTrendGate(closes, volumes, highs, lows, dates);
 
   // (3) Bộ chỉ báo Trend khung NGÀY — bắt điểm gom hàng cụ thể
   const { trendDefs } = buildDefs(closes, volumes, highs, lows);
 
-  // Pivot đáy khung NGÀY dùng làm SL (thay cho % cố định) — xác nhận sau 4
-  // phiên như quy ước pivot ngày dùng ở nơi khác trong app. Tích luỹ nhân
-  // quả theo từng phiên để không nhìn trước.
+  // Pivot đáy NGÀY — chỉ dùng cho SL BAN ĐẦU (xác nhận sau 4 phiên)
   const dPiv = pivots(closes, 4, highs, lows);
   let pdi = 0;
-  const confirmedLows = [];
-  const nearestPivotLowBelow = (priceRef) => {
-    for (let k = confirmedLows.length - 1; k >= 0; k--)
-      if (confirmedLows[k] < priceRef) return confirmedLows[k];
+  const confirmedDailyLows = [];
+  const nearestDailyLowBelow = (p) => {
+    for (let k = confirmedDailyLows.length - 1; k >= 0; k--)
+      if (confirmedDailyLows[k] < p) return confirmedDailyLows[k];
+    return null;
+  };
+
+  // Pivot đáy TUẦN — dùng cho TRAILING (xác nhận sau 2 tuần đã đóng)
+  const wkC = aggWeekly(closes, dates);
+  const wkHL2 = aggWeeklyHL(H_, L_, dates);
+  const wPiv = pivots(wkC.closes, 2, wkHL2.highs, wkHL2.lows);
+  let pwi = 0;
+  const confirmedWeeklyLows = [];
+  const nearestWeeklyLowBelow = (p) => {
+    for (let k = confirmedWeeklyLows.length - 1; k >= 0; k--)
+      if (confirmedWeeklyLows[k] < p) return confirmedWeeklyLows[k];
     return null;
   };
 
   const trades = [];
   let pos = null;
-  // TP nằm ở khung tháng (có thể là một move kéo dài nhiều tháng) nên thời
-  // gian giữ tối đa phải đủ rộng để mục tiêu có cơ hội chạm tới — mặc định
-  // 120 phiên (~6 tháng); đặt quá ngắn sẽ khiến phần lớn lệnh bị "hết hạn
-  // giữ" trước khi kịp đạt TP, kéo kết quả xuống dù R:R mỗi lệnh vẫn tốt.
   const maxHold = opts.cardMaxHold || 120;
-  const stopPct = opts.stopPct || 0.1; // chỉ dùng khi chưa có pivot đáy nào phía dưới
+  const stopPct = opts.stopPct || 0.1;
   const minRR = opts.minRR || 1.0;
+  const wExitThr = opts.weekExitThr != null ? opts.weekExitThr : -0.3;
+  const timeoutMinR = opts.timeoutMinR != null ? opts.timeoutMinR : 0.5;
   const start = Math.max(300, 210);
 
+  // Ghi toàn bộ fragment rủi ro của vị thế hiện tại tại một mốc thoát/chốt.
+  const bookExit = (exitIdx, exitPrice, stoppedOut, reason) => {
+    for (const lot of pos.lots) {
+      trades.push({
+        entryIdx: lot.idx,
+        exitIdx,
+        finalExitIdx: exitIdx,
+        side: 1,
+        entryPrice: lot.price,
+        exitPrice,
+        finalExitPrice: exitPrice,
+        slDistance: lot.slDist,
+        R: (exitPrice - lot.price) / lot.slDist,
+        ret: (exitPrice - lot.price) / lot.price,
+        priceDiff: exitPrice - lot.price,
+        stoppedOut,
+        exitReason: reason,
+        scen: pos.state,
+        numAdds: pos.addCount,
+        riskWeight: lot.w,
+      });
+    }
+  };
+
   for (let i = start; i < n; i++) {
-    // Xác nhận thêm pivot đáy tới ngày i-1 (chỉ dùng dữ liệu đã biết)
+    // Xác nhận thêm pivot đáy NGÀY tới i-1 (chỉ dùng dữ liệu đã biết)
     while (pdi < dPiv.length && dPiv[pdi].i + 4 <= i - 1) {
-      if (dPiv[pdi].type === "L") confirmedLows.push(dPiv[pdi].price);
+      if (dPiv[pdi].type === "L") confirmedDailyLows.push(dPiv[pdi].price);
       pdi++;
     }
-    // (a) Quản lý vị thế đang mở — quét TP/SL bằng High/Low THẬT của phiên i
+    // Xác nhận pivot đáy TUẦN — chỉ dùng các tuần ĐÃ ĐÓNG trước tuần chứa i
+    const lastClosedWeek = wGate.dayWeekIdx[i] - 1;
+    while (pwi < wPiv.length && wPiv[pwi].i + 2 <= lastClosedWeek) {
+      if (wPiv[pwi].type === "L") confirmedWeeklyLows.push(wPiv[pwi].price);
+      pwi++;
+    }
+
+    // (a) Quản lý vị thế đang mở
     let justExited = false;
     if (pos) {
+      // TRAILING RATCHET: nâng stop lên đáy tuần đã xác nhận gần nhất dưới
+      // giá đóng cửa hôm qua — chỉ nâng, không bao giờ hạ.
+      const twl = nearestWeeklyLowBelow(closes[i - 1]);
+      if (twl != null && twl > pos.stop) pos.stop = twl;
+
       const hi = H_[i],
         lo = L_[i],
         c = closes[i];
       const hitSL = lo <= pos.stop;
-      // Bảo vệ vốn theo khung THÁNG: nếu hỗ trợ (của tháng trước đã đóng)
-      // bị giá đóng cửa phá — kịch bản tháng đã đổi, thoát hết dù chưa dính SL.
+      // Van khung THÁNG: hỗ trợ tháng trước bị giá đóng cửa phá — kịch bản
+      // tháng đã đổi, thoát hết dù trailing SL chưa dính.
       const mS = mCMT.dayS[i];
       const flipDown = mS != null && c < mS;
-      const timeoutHit = i - pos.i0 >= maxHold;
+      // Van khung TUẦN: đồng thuận Trend tuần âm sâu 2 tuần ĐÃ ĐÓNG liên
+      // tiếp — cấu trúc xu hướng tuần gãy, không chờ tới hỗ trợ tháng.
+      const wflip =
+        lastClosedWeek >= 1 &&
+        wGate.weekNet[lastClosedWeek] < wExitThr &&
+        wGate.weekNet[lastClosedWeek - 1] < wExitThr;
+      // Timeout CHỈ cho lệnh không chạy — đang lãi rõ thì để sóng chạy tiếp
+      const refSl = pos.lots[0].slDist;
+      const timeoutHit =
+        i - pos.i0 >= maxHold && (c - pos.avgEntry) / refSl < timeoutMinR;
 
-      if (hitSL || flipDown || timeoutHit) {
-        // Ưu tiên bảo toàn vốn: nếu cùng phiên vừa chạm TP vừa dính SL/vỡ
-        // hỗ trợ, coi như thoát hết trước, không xét bán 50% nữa.
-        const stoppedOut = hitSL || flipDown;
+      if (hitSL || flipDown || wflip || timeoutHit) {
         const exit = hitSL ? pos.stop : c;
-        const reason = hitSL ? "sl" : flipDown ? "flip" : "timeout";
-        if (pos.partialDone) {
-          // Nửa còn lại (đã chốt nửa kia tại TP) — 1 fragment rủi ro 0.5,
-          // tính từ đúng ngày bán 50% (không phải từ ngày gom đầu, vì phần
-          // rủi ro của giai đoạn trước đó đã ghi nhận riêng lúc chạm TP).
-          trades.push({
-            entryIdx: pos.partialAtIdx,
-            exitIdx: i,
-            finalExitIdx: i,
-            side: 1,
-            entryPrice: pos.avgEntry,
-            exitPrice: exit,
-            finalExitPrice: exit,
-            slDistance: pos.slDist,
-            R: (exit - pos.avgEntry) / pos.slDist,
-            ret: (exit - pos.avgEntry) / pos.avgEntry,
-            priceDiff: exit - pos.avgEntry,
-            stoppedOut,
-            exitReason: reason,
-            scen: pos.state,
-            numAdds: pos.lots.length,
-            riskWeight: 0.5,
-          });
-        } else {
-          // Chưa từng chạm TP — mỗi LẦN GOM là 1 fragment rủi ro đầy đủ
-          // (weight 1), tính từ đúng ngày gom đó tới lúc thoát, để rủi ro
-          // cộng dồn ĐÚNG theo số lần đã gom (không bị gộp phẳng về 1 đơn vị).
-          for (const lot of pos.lots) {
-            trades.push({
-              entryIdx: lot.idx,
-              exitIdx: i,
-              finalExitIdx: i,
-              side: 1,
-              entryPrice: lot.price,
-              exitPrice: exit,
-              finalExitPrice: exit,
-              slDistance: pos.slDist,
-              R: (exit - lot.price) / pos.slDist,
-              ret: (exit - lot.price) / lot.price,
-              priceDiff: exit - lot.price,
-              stoppedOut,
-              exitReason: reason,
-              scen: pos.state,
-              numAdds: pos.lots.length,
-              riskWeight: 1,
-            });
-          }
-        }
+        const reason = hitSL
+          ? "sl"
+          : flipDown
+          ? "flip"
+          : wflip
+          ? "wflip"
+          : "timeout";
+        bookExit(i, exit, hitSL || flipDown || wflip, reason);
         pos = null;
         justExited = true;
-      } else if (!pos.partialDone && pos.tp != null && hi >= pos.tp) {
-        // Chạm TP: bán 50%, phần còn lại chạy tiếp — không đóng lệnh hẳn.
-        // Ghi nhận rủi ro ĐẦY ĐỦ (weight 1) cho từng lần đã gom, từ đúng
-        // ngày gom tới ngày chạm TP hôm nay — đúng quy mô vị thế thật lúc
-        // chốt lời, không bị gộp phẳng về 1 đơn vị rủi ro như trước.
-        for (const lot of pos.lots) {
-          trades.push({
-            entryIdx: lot.idx,
-            exitIdx: i,
-            finalExitIdx: i,
-            side: 1,
-            entryPrice: lot.price,
-            exitPrice: pos.tp,
-            finalExitPrice: pos.tp,
-            slDistance: pos.slDist,
-            R: (pos.tp - lot.price) / pos.slDist,
-            ret: (pos.tp - lot.price) / lot.price,
-            priceDiff: pos.tp - lot.price,
-            stoppedOut: false,
-            exitReason: "tp_partial",
-            scen: pos.state,
-            numAdds: pos.lots.length,
-            riskWeight: 1,
-          });
-        }
+      } else if (pos.tp != null && hi >= pos.tp) {
+        // Chạm TP tháng: ghi nhận rủi ro ĐẦY ĐỦ theo weight từng lot (từ
+        // đúng ngày gom tới hôm nay — đúng quy mô vị thế thật lúc chốt),
+        // rồi giữ lại 50% TỔNG vị thế chạy tiếp theo trailing tuần
+        // (rebook một lot gộp tại giá TP, weight = 50% tổng weight cũ).
+        bookExit(i, pos.tp, false, "tp_partial");
+        const totW = pos.lots.reduce((s, l) => s + l.w, 0);
+        pos.lots = [
+          { idx: i, price: pos.tp, slDist: pos.lots[0].slDist, w: totW * 0.5 },
+        ];
+        pos.avgEntry = pos.tp;
+        pos.lastTakenTarget = pos.tp;
+        pos.tp = null; // chờ target tháng MỚI cao hơn để tái vũ trang
         pos.partialDone = true;
-        pos.partialAtIdx = i; // mốc để tính fragment rủi ro 0.5 của nửa còn lại
-        pos.tp = null; // không còn TP cho nửa còn lại — chạy tới khi SL/tháng đảo chiều
       }
     }
     if (justExited) continue;
@@ -3577,60 +3591,62 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     const j = i - 1;
     const lastC = closes[j];
 
-    // (1) CMT khung THÁNG: hướng + target — dùng trạng thái NGÀY j (High
-    // chạy dồn từ đầu tháng hiện tại tới ngày j, so với R/S tháng trước đã
-    // đóng) — nhạy hơn, không cần chờ cả tháng đóng cửa mới xác nhận.
-    // Chỉ vào khi ĐÃ BREAKOUT LÊN — bỏ hẳn kịch bản "trong biên" (dữ liệu
-    // backtest cho thấy trong biên thua lỗ nặng còn breakout thắng đều).
+    // (1) CMT khung THÁNG: chỉ vào/gom khi ĐÃ BREAKOUT LÊN và target còn
+    // phía trên giá — bỏ hẳn kịch bản "trong biên" (backtest cho thấy
+    // trong biên thua lỗ nặng ở hầu hết mã VN30).
     const state = mCMT.dayState[j];
     const target = mCMT.dayTarget[j];
     if (state !== "RUN_UP" || target == null || target <= lastC) continue;
 
-    // Đã bán 50% (đang chạy phần còn lại) thì không gom thêm nữa
-    if (pos && pos.partialDone) continue;
+    // Sau khi đã chốt 50%: chỉ TÁI VŨ TRANG khi target tháng MỚI cao hơn
+    // mức đã chốt — bậc thang theo sóng, không mua lại cùng một bậc.
+    if (pos && pos.partialDone && target <= pos.lastTakenTarget * 1.001)
+      continue;
 
-    // (2) Xác nhận khung TUẦN: đồng thuận tuần trước phải còn dương mới gom
+    // (2) Xác nhận tuần: đồng thuận tuần trước phải còn dương mới gom
     const wIdx = wGate.dayWeekIdx[j] - 1;
-    if (wIdx < 0) continue;
-    const weeklyOK = wGate.weekNet[wIdx] > 0;
-    if (!weeklyOK) continue;
+    if (wIdx < 0 || wGate.weekNet[wIdx] <= 0) continue;
 
-    // (3) Xuống khung ngày: đồng thuận mua + giá vừa giảm → mở lệnh mới
-    // hoặc GOM THÊM nếu đang giữ, miễn còn đủ R:R với TP tháng hiện tại.
+    // (3) Khung ngày: đồng thuận mua + giá vừa giảm → mở mới hoặc gom thêm
     const dailyConsensus = netAtDefs(trendDefs, j);
     const pulledBack = j >= 1 && closes[j] < closes[j - 1];
-    if (dailyConsensus > ENTRY_CONSENSUS_THR && pulledBack) {
-      const entry = lastC;
-      // SL = pivot đáy NGÀY gần nhất phía dưới giá vào (không dùng % cố
-      // định) — nếu chưa có pivot đáy nào xác nhận phía dưới, tạm dùng %
-      // làm lưới an toàn dự phòng.
-      const pivotLow = nearestPivotLowBelow(entry);
+    if (!(dailyConsensus > ENTRY_CONSENSUS_THR && pulledBack)) continue;
+
+    const entry = lastC;
+    if (!pos) {
+      // Lệnh mới: SL ban đầu = pivot đáy NGÀY gần nhất dưới giá vào;
+      // chưa có pivot nào phía dưới thì dùng % dự phòng.
+      const pivotLow = nearestDailyLowBelow(entry);
       const stopLevel = pivotLow != null ? pivotLow : entry * (1 - stopPct);
-      const slDistProxy = entry - stopLevel;
-      if (slDistProxy <= 0) continue;
-      const rewardDist = target - entry;
-      if (rewardDist < slDistProxy * minRR) continue; // R:R không đủ — bỏ qua lần này
-      if (!pos) {
-        pos = {
-          i0: i,
-          lots: [{ idx: i, price: entry }],
-          avgEntry: entry,
-          slDist: slDistProxy,
-          stop: stopLevel,
-          tp: target,
-          state,
-          partialDone: false,
-        };
-      } else {
-        pos.lots.push({ idx: i, price: entry });
-        pos.avgEntry = pos.lots.reduce((s, l) => s + l.price, 0) / pos.lots.length;
-        // Gom thêm: lấy lại pivot đáy gần nhất dưới giá vào TRUNG BÌNH mới
-        const pivotLow2 = nearestPivotLowBelow(pos.avgEntry);
-        pos.stop = pivotLow2 != null ? pivotLow2 : pos.avgEntry * (1 - stopPct);
-        pos.slDist = pos.avgEntry - pos.stop;
-        pos.tp = target; // cập nhật theo target tháng mới nhất
-        pos.state = state;
-      }
+      const slDist = entry - stopLevel;
+      if (slDist < entry * MIN_SL_PCT) continue; // stop quá sát → bỏ qua
+      if (target - entry < slDist * minRR) continue;
+      pos = {
+        i0: i,
+        lots: [{ idx: i, price: entry, slDist, w: 1 }],
+        avgEntry: entry,
+        stop: stopLevel,
+        tp: target,
+        state,
+        addCount: 1,
+        partialDone: false,
+        lastTakenTarget: null,
+      };
+    } else {
+      // GOM THÊM: rủi ro lot mới đo tới stop HIỆN HÀNH (đã trailing) —
+      // KHÔNG tính lại stop theo giá vào trung bình. Stop sát giá hoặc
+      // target còn ít → R:R rớt dưới minRR → tự động không gom.
+      const slDist = entry - pos.stop;
+      if (slDist < entry * MIN_SL_PCT) continue;
+      if (target - entry < slDist * minRR) continue;
+      pos.lots.push({ idx: i, price: entry, slDist, w: 1 });
+      pos.addCount++;
+      const totW = pos.lots.reduce((s, l) => s + l.w, 0);
+      pos.avgEntry =
+        pos.lots.reduce((s, l) => s + l.price * l.w, 0) / totW;
+      pos.tp = target; // cập nhật theo target tháng mới nhất
+      pos.state = state;
+      if (pos.partialDone) pos.partialDone = false; // tái vũ trang — bậc TP mới
     }
   }
 
@@ -3638,22 +3654,24 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
   let live;
   if (pos) {
     const lastC = closes[n - 1];
+    const refSl = pos.lots[0].slDist;
     live = {
       active: true,
       entryIdx: pos.i0,
       entryDate: dates[pos.i0],
       entryPrice: pos.avgEntry,
-      numAdds: pos.lots.length,
+      numAdds: pos.addCount,
       lastAddDate: dates[pos.lots[pos.lots.length - 1].idx],
       stop: pos.stop,
       tp: pos.tp,
       partialDone: pos.partialDone,
       cmtState: pos.state,
       daysHeld: n - 1 - pos.i0,
-      unrealizedR: (lastC - pos.avgEntry) / pos.slDist,
+      unrealizedR: (lastC - pos.avgEntry) / refSl,
       unrealizedPct: (lastC / pos.avgEntry - 1) * 100,
       openedToday: pos.i0 === n - 1,
-      addedToday: pos.lots.length > 1 && pos.lots[pos.lots.length - 1].idx === n - 1,
+      addedToday:
+        pos.addCount > 1 && pos.lots[pos.lots.length - 1].idx === n - 1,
     };
   } else {
     const lastTrade = trades[trades.length - 1];
@@ -5277,16 +5295,16 @@ function LiveDeskPanel({ rows, openStock }) {
   const closedToday = rows.filter(
     (r) => r.live && !r.live.active && r.live.lastExit && r.live.lastExit.exitedToday
   );
-  const reasonVN = { tp: "chạm TP", tp_partial: "chạm TP (bán 50%)", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
+  const reasonVN = { tp: "chạm TP", tp_partial: "chạm TP (chốt 50%)", sl: "dính SL trailing tuần", flip: "vỡ hỗ trợ tháng", wflip: "xu hướng tuần gãy (2 tuần âm)", timeout: "hết hạn — lệnh không chạy" };
   const stateVN = { RUN_UP: "breakout tháng", IN_RANGE: "trong biên tháng" };
   const fmtPct = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
   return (
     <Panel
-      mod="Bàn lệnh · Luật CMT × Trend"
+      mod="Bàn lệnh · Luật CMT × Trend v2"
       title={`Đang giữ ${holding.length} mã${
         openedToday.length ? ` · mở mới hôm nay ${openedToday.length}` : ""
       }${closedToday.length ? ` · đóng hôm nay ${closedToday.length}` : ""}`}
-      sub="Luật: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN — xác nhận bằng High cao nhất tính từ đầu tháng tới hôm nay (không chờ tháng đóng cửa), TP = target đo bằng biên độ mở rộng · (2) Xác nhận xu hướng khung TUẦN bằng bộ chỉ báo Trend, đảo chiều thì ngừng gom (không tự thoát) · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R. SL = pivot đáy ngày gần nhất. Chạm TP: bán 50%, phần còn lại chạy tiếp; thoát hết khi dính SL hoặc khung THÁNG chuyển kịch bản giảm. Chỉ Long."
+      sub="Luật v2 — tối ưu giữ sóng dài: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN — High chạy dồn từ đầu tháng phá kháng cự tháng trước đã đóng · (2) đồng thuận Trend khung TUẦN còn dương mới được gom · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R. SL ban đầu = pivot đáy NGÀY; sau đó TRAILING lên đáy pivot TUẦN (chỉ nâng, không hạ) — nhịp chỉnh ngày không còn đá lệnh ra giữa sóng. Chạm TP: chốt 50%, phần còn lại chạy theo trailing và TÁI VŨ TRANG khi có bậc target tháng mới cao hơn. Thoát hết khi: dính trailing SL / vỡ hỗ trợ tháng / xu hướng tuần âm 2 tuần liên tiếp / timeout chỉ áp cho lệnh không chạy. Chỉ Long."
     >
       {holding.length === 0 ? (
         <p className="sub">
@@ -5303,7 +5321,7 @@ function LiveDeskPanel({ rows, openStock }) {
                 <th>Số lần gom</th>
                 <th>Số phiên giữ</th>
                 <th>Giá vào TB</th>
-                <th>SL</th>
+                <th>SL (trailing tuần)</th>
                 <th>TP</th>
                 <th>Lãi/lỗ tạm tính</th>
                 <th>Bối cảnh</th>
@@ -5336,7 +5354,7 @@ function LiveDeskPanel({ rows, openStock }) {
                     {r.live.stop.toLocaleString("vi-VN")}
                   </td>
                   <td className="num" style={{ color: CLR.bull }}>
-                    {r.live.tp != null ? r.live.tp.toLocaleString("vi-VN") : "đã bán 50% — chạy tiếp"}
+                    {r.live.tp != null ? r.live.tp.toLocaleString("vi-VN") : "đã chốt 50% — trailing, chờ bậc TP mới"}
                   </td>
                   <td
                     className="num"
@@ -5349,7 +5367,7 @@ function LiveDeskPanel({ rows, openStock }) {
                   </td>
                   <td style={{ color: CLR.mut, fontSize: 12 }}>
                     {stateVN[r.live.cmtState] || r.live.cmtState}
-                    {r.live.partialDone && " · đã bán 50%, đang chạy tiếp"}
+                    {r.live.partialDone && " · đã chốt 50%, trailing chờ bậc mới"}
                   </td>
                   <td>
                     <button className="bt" onClick={() => openStock(r.key)}>
@@ -7852,7 +7870,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
       <Panel
         mod="Hurst · Tham số mô phỏng"
         title="Vốn & rủi ro của bạn"
-        sub="Áp cho backtest và mô phỏng tài khoản. TTCK VN không có bán khống nên toàn bộ hệ thống chỉ mở lệnh Mua (Long) — khi CMT báo breakdown, hệ thống đứng ngoài thay vì mở lệnh ngược. TP nay tính theo khung tháng nên 'Giữ tối đa' cần đủ rộng để mục tiêu có cơ hội chạm tới."
+        sub="Áp cho backtest và mô phỏng tài khoản. TTCK VN không có bán khống nên toàn bộ hệ thống chỉ mở lệnh Mua (Long) — khi CMT báo breakdown, hệ thống đứng ngoài thay vì mở lệnh ngược. Luật v2 thoát bằng TRAILING đáy tuần nên 'Giữ tối đa' chỉ áp cho lệnh KHÔNG chạy (lãi dưới ngưỡng R) — lệnh đang lãi được giữ theo sóng, không bị đuổi ra."
       >
         <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-end" }}>
           <div>
@@ -7945,7 +7963,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
             />
           </div>
           <div>
-            <label className="lb">Giữ tối đa (phiên) — luật tháng</label>
+            <label className="lb">Giữ tối đa — chỉ khi lệnh không chạy</label>
             <input
               className="inp"
               style={{ width: 90 }}
@@ -7954,6 +7972,38 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
               max="500"
               value={opts.cardMaxHold}
               onChange={(e) => setOpt("cardMaxHold", Math.max(20, Math.min(500, +e.target.value || 120)))}
+            />
+          </div>
+          <div>
+            <label className="lb">Van thoát tuần (net ≤)</label>
+            <input
+              className="inp"
+              style={{ width: 90 }}
+              type="number"
+              step="0.05"
+              min="-1"
+              max="0"
+              value={opts.weekExitThr}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setOpt("weekExitThr", isNaN(v) ? -0.3 : Math.max(-1, Math.min(0, v)));
+              }}
+            />
+          </div>
+          <div>
+            <label className="lb">Timeout nếu lãi dưới (R)</label>
+            <input
+              className="inp"
+              style={{ width: 90 }}
+              type="number"
+              step="0.1"
+              min="0"
+              max="3"
+              value={opts.timeoutMinR}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setOpt("timeoutMinR", isNaN(v) ? 0.5 : Math.max(0, Math.min(3, v)));
+              }}
             />
           </div>
           <div>
@@ -8195,15 +8245,15 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
           IN_RANGE: "Mua theo pullback ngày, tháng đang trong biên",
         };
         const scenRows = Object.entries(cb.byScen).sort((a, b) => b[1].n - a[1].n);
-        const reasonVN = { tp: "chạm TP", tp_partial: "chạm TP (bán 50%)", sl: "dính SL", flip: "CMT cảnh báo giảm", timeout: "hết hạn giữ" };
+        const reasonVN = { tp: "chạm TP", tp_partial: "chạm TP (chốt 50%)", sl: "dính SL trailing tuần", flip: "vỡ hỗ trợ tháng", wflip: "xu hướng tuần gãy (2 tuần âm)", timeout: "hết hạn — lệnh không chạy" };
         const stateVN2 = { RUN_UP: "breakout tháng", IN_RANGE: "trong biên tháng" };
         return (
           <Panel
-            mod="Hurst · Backtest theo luật CMT × Trend"
+            mod="Hurst · Backtest theo luật CMT × Trend v2"
             title={`${cfg.label} — nếu bám đúng luật thì lời/lỗ ra sao?`}
-            sub={`Luật: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN — xác nhận bằng High cao nhất từ đầu tháng hiện tại tới hôm nay so với kháng cự tháng trước đã đóng (không chờ đóng cửa cả tháng) · (2) Xác nhận khung TUẦN bằng bộ chỉ báo Trend, đảo chiều thì ngừng gom · (3) xuống khung ngày GOM lệnh khi bộ chỉ báo đồng thuận mua + giá vừa giảm + còn đủ R:R (giá vào tính trung bình). SL = pivot đáy ngày gần nhất dưới giá vào TB, chỉ gom khi TP ≥ ${opts.minRR.toFixed(
+            sub={`Luật v2 — tối ưu giữ sóng dài: (1) CHỈ VÀO KHI THÁNG ĐÃ BREAKOUT LÊN — High chạy dồn từ đầu tháng phá kháng cự tháng trước đã đóng (không chờ đóng cửa cả tháng) · (2) đồng thuận Trend khung TUẦN còn dương mới gom · (3) gom khung ngày khi đồng thuận mua + giá vừa giảm + TP ≥ ${opts.minRR.toFixed(
               1
-            )}× khoảng cách SL. Chạm TP: bán 50%, phần còn lại chạy tiếp tới khi dính SL hoặc khung tháng chuyển kịch bản giảm. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lệnh. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
+            )}× khoảng cách SL. SL ban đầu = pivot đáy NGÀY; sau đó TRAILING lên đáy pivot TUẦN (chỉ nâng, không hạ — nhịp chỉnh ngày không đá lệnh ra giữa sóng). Chạm TP: chốt 50%, phần còn lại chạy theo trailing và TÁI VŨ TRANG khi có bậc target tháng mới cao hơn. Thoát hết khi: dính trailing SL / vỡ hỗ trợ tháng / xu hướng tuần ≤ ${opts.weekExitThr} hai tuần liên tiếp / quá ${opts.cardMaxHold} phiên mà lãi < ${opts.timeoutMinR}R. Vốn ${fmtMoney(capital.value)}, rủi ro ${riskPctIn.value}%/lần gom. Mô phỏng nhân quả từ ${cb.oosFromDate}.`}
           >
             <div
               style={{
@@ -8227,9 +8277,9 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                     Đã gom {cb.live.numAdds} lần{cb.live.addedToday ? " · THÊM HÔM NAY" : ""} · lần gần nhất {cb.live.lastAddDate}
                   </Chip>
                   <Chip cls="mut">
-                    Vào TB {cb.live.entryPrice.toLocaleString("vi-VN")} · SL{" "}
+                    Vào TB {cb.live.entryPrice.toLocaleString("vi-VN")} · SL trailing{" "}
                     {cb.live.stop.toLocaleString("vi-VN")} · TP{" "}
-                    {cb.live.tp != null ? cb.live.tp.toLocaleString("vi-VN") : "đã bán 50% — chạy tiếp"}
+                    {cb.live.tp != null ? cb.live.tp.toLocaleString("vi-VN") : "đã chốt 50% — trailing, chờ bậc TP mới"}
                   </Chip>
                   <Chip cls={cb.live.unrealizedPct >= 0 ? "up" : "down"}>
                     Tạm tính {cb.live.unrealizedPct >= 0 ? "+" : ""}
@@ -8237,7 +8287,7 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                   </Chip>
                   <Chip cls="mut">
                     Bối cảnh: {stateVN2[cb.live.cmtState] || cb.live.cmtState}
-                    {cb.live.partialDone && " · đã bán 50%, đang chạy tiếp"}
+                    {cb.live.partialDone && " · đã chốt 50%, trailing chờ bậc mới"}
                   </Chip>
                 </>
               ) : (
@@ -8627,6 +8677,8 @@ export default function App() {
     minPullbackATR: 0,
     rangeEnterThr: 0.2,
     cardMaxHold: 120,
+    weekExitThr: -0.3,
+    timeoutMinR: 0.5,
   });
 
   useEffect(() => {
@@ -8670,8 +8722,10 @@ export default function App() {
       hurstWin: opts.hurstWin,
       hurstStep: opts.hurstStep,
       cardMaxHold: opts.cardMaxHold,
+      weekExitThr: opts.weekExitThr,
+      timeoutMinR: opts.timeoutMinR,
     }),
-    [opts.atrPeriod, opts.slMult, opts.stopPct, opts.minRR, riskPctIn, opts.hurstWin, opts.hurstStep, opts.cardMaxHold]
+    [opts.atrPeriod, opts.slMult, opts.stopPct, opts.minRR, riskPctIn, opts.hurstWin, opts.hurstStep, opts.cardMaxHold, opts.weekExitThr, opts.timeoutMinR]
   );
 
   const screener = useMemo(() => {
