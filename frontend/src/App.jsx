@@ -375,6 +375,33 @@ function aggMonthlyHL(highs, lows, dates) {
   });
   return { highs: oh, lows: ol, dates: md };
 }
+// Gộp OHLC đầy đủ theo THÁNG (có Open, khác aggMonthlyHL chỉ có High/Low) —
+// cần Open để xác định MÀU nến tháng (xanh: đóng ≥ mở · đỏ: đóng < mở) cho
+// các chiến lược trung bình giá (DCA) theo nến tháng bên dưới.
+function aggMonthlyOHLC(opens, highs, lows, closes, dates) {
+  const oo = [],
+    oh = [],
+    ol = [],
+    oc = [],
+    md = [];
+  let cur = null;
+  closes.forEach((c, i) => {
+    const key = dates[i].slice(0, 7);
+    if (key !== cur) {
+      oo.push(opens[i]);
+      oh.push(highs[i]);
+      ol.push(lows[i]);
+      oc.push(c);
+      md.push(key + "-01");
+      cur = key;
+    } else {
+      oh[oh.length - 1] = Math.max(oh[oh.length - 1], highs[i]);
+      ol[ol.length - 1] = Math.min(ol[ol.length - 1], lows[i]);
+      oc[oc.length - 1] = c;
+    }
+  });
+  return { opens: oo, highs: oh, lows: ol, closes: oc, dates: md };
+}
 function dowTrend(piv) {
   const H = piv.filter((p) => p.type === "H").slice(-2);
   const L = piv.filter((p) => p.type === "L").slice(-2);
@@ -3811,7 +3838,160 @@ function summarizeRuleBacktest(engine, closes, dates, opts) {
   };
 }
 
-function runHurstAnalysis(closes, volumes, dates, opts, direction, digits, highs, lows) {
+// ============================================================
+// ĐỐI CHỨNG THÊM: CHIẾN LƯỢC TRUNG BÌNH GIÁ (DCA) THEO NẾN THÁNG
+//
+// Hai biến thể VÀO LỆNH (song song với luật CMT×Trend ở trên, không phụ
+// thuộc breakout/pullback — thuần theo lịch tháng):
+//   • "everyMonth" — mỗi khi ĐÓNG NẾN THÁNG, vào 1 lệnh mới = 1% tài khoản
+//     HIỆN TẠI, bất kể màu nến/giá.
+//   • "redOnly"    — chỉ vào lệnh khi nến THÁNG vừa đóng là nến ĐỎ (đóng <
+//     mở), mỗi lệnh vẫn 1% tài khoản; tháng nến XANH thì bỏ qua, đến tháng
+//     ĐỎ tiếp theo lại vào bình thường như mọi lần khác (không dồn gấp bội
+//     — "mua bù" ở đây nghĩa là mốc mua giãn ra theo tháng đỏ, không phải
+//     nhân đôi khối lượng).
+//
+// Cả hai dùng CHUNG một lưới quản trị:
+//   • SL = pivot đáy THÁNG gần nhất đã XÁC NHẬN (sau pivK tháng) dưới giá
+//     hiện tại — chỉ TRAILING LÊN, không hạ; nến tháng chạm/xuyên SL → đóng
+//     TOÀN BỘ vị thế tại giá SL, reset bộ đếm, chờ tín hiệu vào lại.
+//   • Chốt lời theo SỐ NẾN THÁNG XANH CỘNG DỒN kể từ lần đóng vị thế gần
+//     nhất nhất (không cần liền nhau — đúng như đề bài: chuỗi 15 nến có đủ
+//     10 nến xanh thì chốt toàn bộ). exitGreenN = null → GIỮ MÃI MÃI, chỉ
+//     thoát khi dính SL.
+// ============================================================
+const DCA_EXIT_VARIANTS = [
+  { key: "never", label: "Giữ mãi mãi — không bao giờ chốt lời", n: null },
+  { key: "g10", label: "Chốt khi đủ 10 nến tháng xanh", n: 10 },
+  { key: "g20", label: "Chốt khi đủ 20 nến tháng xanh", n: 20 },
+  { key: "g30", label: "Chốt khi đủ 30 nến tháng xanh", n: 30 },
+];
+function runMonthlyDCA(mo, entryMode, exitGreenN, pivK = 2) {
+  const n = mo.closes.length;
+  const start = pivK + 1;
+  if (n < start + 6) return null;
+  const piv = pivots(mo.closes, pivK, mo.highs, mo.lows);
+  let pi = 0;
+  const confirmedLows = [];
+  const nearestLowBelow = (p) => {
+    for (let k = confirmedLows.length - 1; k >= 0; k--)
+      if (confirmedLows[k] < p) return confirmedLows[k];
+    return null;
+  };
+
+  let cash = 1,
+    shares = 0,
+    stop = null,
+    greenCount = 0,
+    lastEquity = 1,
+    peak = 1,
+    maxDD = 0;
+  const trades = [];
+  const equity = [];
+  const monthlyReturns = [];
+
+  for (let m = start; m < n; m++) {
+    // Xác nhận thêm pivot đáy đã đủ pivK tháng sau nó (chỉ dùng dữ liệu đã biết tới tháng m-1)
+    while (pi < piv.length && piv[pi].i + pivK <= m - 1) {
+      if (piv[pi].type === "L") confirmedLows.push(piv[pi].price);
+      pi++;
+    }
+
+    const price = mo.closes[m];
+    const open = mo.opens[m];
+    const low = mo.lows[m];
+    const isGreen = price >= open;
+    if (isGreen) greenCount++;
+
+    // (a) Dính SL — đóng toàn bộ vị thế trước khi xét gì khác trong tháng này
+    if (shares > 0 && stop != null && low <= stop) {
+      cash += shares * stop;
+      shares = 0;
+      trades.push({ type: "sl", idx: m });
+      greenCount = 0;
+      stop = null;
+    }
+
+    // (b) Chốt lời theo bộ đếm nến xanh cộng dồn kể từ lần đóng gần nhất
+    if (shares > 0 && exitGreenN != null && greenCount >= exitGreenN) {
+      cash += shares * price;
+      shares = 0;
+      trades.push({ type: "tp", idx: m });
+      greenCount = 0;
+      stop = null;
+    }
+
+    // (c) Vào lệnh mới theo luật của biến thể — 1% tài khoản HIỆN TẠI
+    const shouldEnter =
+      entryMode === "everyMonth" || (entryMode === "redOnly" && !isGreen);
+    if (shouldEnter) {
+      const equityNow = cash + shares * price;
+      const lot = equityNow * 0.01;
+      if (lot > 0 && lot <= cash + 1e-9) {
+        shares += lot / price;
+        cash -= lot;
+      }
+    }
+
+    // (d) Cập nhật SL — trailing lên đáy pivot tháng gần nhất dưới giá, chỉ nâng không hạ
+    if (shares > 0) {
+      const cand = nearestLowBelow(price);
+      if (cand != null && (stop == null || cand > stop)) stop = cand;
+    }
+
+    const eq = cash + shares * price;
+    monthlyReturns.push(eq / lastEquity - 1);
+    lastEquity = eq;
+    if (eq > peak) peak = eq;
+    const dd = (eq - peak) / peak;
+    if (dd < maxDD) maxDD = dd;
+    equity.push({ d: mo.dates[m], cum: (eq - 1) * 100 });
+  }
+
+  const ms = mstd(monthlyReturns);
+  const sharpe = ms.sd > 0 ? (ms.mean / ms.sd) * Math.sqrt(12) : 0;
+  return {
+    equity,
+    totalReturnPct: (lastEquity - 1) * 100,
+    maxDDPct: maxDD * 100,
+    finalMultiple: lastEquity,
+    sharpe,
+    tradeCount: trades.length,
+    slCount: trades.filter((t) => t.type === "sl").length,
+    tpCount: trades.filter((t) => t.type === "tp").length,
+    stillOpen: shares > 0,
+    trades,
+  };
+}
+// Mua & Giữ theo nến THÁNG (cùng nhịp dữ liệu với DCA) — mốc đối chứng công bằng.
+function buyHoldMonthly(mo, fromIdx) {
+  const base = mo.closes[fromIdx];
+  const equity = [];
+  for (let m = fromIdx; m < mo.closes.length; m++) {
+    equity.push({ d: mo.dates[m], cum: (mo.closes[m] / base - 1) * 100 });
+  }
+  return { equity, totalReturnPct: (mo.closes[mo.closes.length - 1] / base - 1) * 100 };
+}
+function runMonthlyDCACompare(closes, opens, highs, lows, dates) {
+  if (!opens) return null;
+  const mo = aggMonthlyOHLC(opens, highs, lows, closes, dates);
+  const pivK = 2;
+  if (mo.closes.length < pivK + 8) return null;
+  const variants = {};
+  ["everyMonth", "redOnly"].forEach((mode) => {
+    variants[mode] = {};
+    DCA_EXIT_VARIANTS.forEach((ex) => {
+      variants[mode][ex.key] = runMonthlyDCA(mo, mode, ex.n, pivK);
+    });
+  });
+  return {
+    mo,
+    buyHold: buyHoldMonthly(mo, pivK + 1),
+    variants,
+  };
+}
+
+function runHurstAnalysis(closes, volumes, dates, opts, direction, digits, highs, lows, opens) {
   PRICE_UNIT = 1;
   const n = closes.length;
   const bh = Array(n).fill(0),
@@ -4102,6 +4282,7 @@ function runHurstAnalysis(closes, volumes, dates, opts, direction, digits, highs
     dates,
     opts
   );
+  const dcaCompare = runMonthlyDCACompare(closes, opens, highs, lows, dates);
 
   return {
     dates,
@@ -4138,6 +4319,7 @@ function runHurstAnalysis(closes, volumes, dates, opts, direction, digits, highs
     rangeNetToday,
     profitViews,
     cardBacktest,
+    dcaCompare,
   };
 }
 
@@ -7825,6 +8007,7 @@ const REGIME_STRAT = {
 
 function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate }) {
   const [profitView, setProfitView] = React.useState("combined");
+  const [dcaMode, setDcaMode] = React.useState("everyMonth");
   if (!detail)
     return (
       <Panel mod="Hurst" title="Đang chạy walk-forward…" sub="Đối chiếu trạng thái CMT với Hurst cho mã đang chọn." />
@@ -8489,6 +8672,105 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
         );
       })()}
 
+      {(() => {
+        const dc = d.dcaCompare;
+        if (!dc) return null;
+        const modeLabel = { everyMonth: "Mỗi tháng đều mua", redOnly: "Chỉ mua khi nến tháng đỏ" };
+        const modeSub = {
+          everyMonth: "Mỗi khi đóng nến THÁNG, vào 1 lệnh mới = 1% tài khoản hiện tại, bất kể màu nến/giá.",
+          redOnly: "Chỉ vào lệnh khi nến THÁNG vừa đóng là nến ĐỎ (đóng < mở), mỗi lệnh vẫn 1% tài khoản; tháng nến xanh thì bỏ qua, đến tháng đỏ tiếp theo lại mua bình thường.",
+        };
+        const v = dc.variants[dcaMode];
+        const bh = dc.buyHold;
+        const colorOf = { never: CLR.bull, g10: "#facc15", g20: CLR.blue, g30: "#f97316" };
+        const chartData = (() => {
+          const byD = {};
+          bh.equity.forEach((e) => {
+            (byD[e.d] = byD[e.d] || { d: e.d }).bh = capital.value * (1 + e.cum / 100);
+          });
+          DCA_EXIT_VARIANTS.forEach((ex) => {
+            const r = v[ex.key];
+            if (!r) return;
+            r.equity.forEach((e) => {
+              (byD[e.d] = byD[e.d] || { d: e.d })[ex.key] = capital.value * (1 + e.cum / 100);
+            });
+          });
+          return Object.values(byD).sort((a, b) => (a.d < b.d ? -1 : 1));
+        })();
+        const nmMap = { bh: "Mua & Giữ", never: "Giữ mãi mãi", g10: "Chốt @10 nến xanh", g20: "Chốt @20 nến xanh", g30: "Chốt @30 nến xanh" };
+        return (
+          <Panel
+            mod="Hurst · Đối chứng — Trung bình giá (DCA) theo nến tháng"
+            title={`${cfg.label} — DCA theo nến tháng, SL tại pivot đáy tháng: giữ mãi mãi vs chốt lời theo số nến xanh`}
+            sub="Hai biến thể vào lệnh thuần theo lịch tháng (không cần breakout/pullback như luật CMT×Trend ở trên), mỗi lệnh 1% tài khoản hiện tại. Cả hai dùng chung SL = pivot đáy THÁNG gần nhất đã xác nhận, chỉ trailing lên. So sánh 4 cách thoát: giữ vị thế mãi mãi (chỉ thoát khi dính SL) với chốt toàn bộ khi số nến tháng XANH cộng dồn kể từ lần đóng gần nhất đạt 10 / 20 / 30 nến (đếm tổng số nến xanh trong chuỗi, không cần liền nhau)."
+          >
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              {Object.keys(modeLabel).map((k) => (
+                <button
+                  key={k}
+                  className="bt"
+                  onClick={() => setDcaMode(k)}
+                  style={
+                    dcaMode === k
+                      ? { borderColor: CLR.blue, color: CLR.text, fontWeight: 700 }
+                      : {}
+                  }
+                >
+                  {modeLabel[k]}
+                </button>
+              ))}
+            </div>
+            <p className="sub" style={{ marginBottom: 12 }}>{modeSub[dcaMode]}</p>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+              <MetricBox
+                label="Mua & Giữ (đối chứng, theo tháng)"
+                value={`${bh.totalReturnPct >= 0 ? "+" : ""}${bh.totalReturnPct.toFixed(1)}%`}
+                color={bh.totalReturnPct >= 0 ? CLR.bull : CLR.bear}
+              />
+              {DCA_EXIT_VARIANTS.map((ex) => {
+                const r = v[ex.key];
+                if (!r) return null;
+                return (
+                  <MetricBox
+                    key={ex.key}
+                    label={ex.label}
+                    value={`${r.totalReturnPct >= 0 ? "+" : ""}${r.totalReturnPct.toFixed(1)}%`}
+                    color={r.totalReturnPct >= 0 ? CLR.bull : CLR.bear}
+                    sub={`MaxDD ${r.maxDDPct.toFixed(1)}% · ${r.slCount} lần dính SL · ${r.tpCount} lần chốt lời · Sharpe(tháng) ${isFinite(r.sharpe) ? r.sharpe.toFixed(2) : "—"}${r.stillOpen ? " · đang giữ" : ""}`}
+                  />
+                );
+              })}
+            </div>
+            <div className="sub" style={{ marginBottom: 4 }}>
+              Đường vốn theo THÁNG — xám đứt = Mua & Giữ · xanh liền = giữ mãi
+              mãi · vàng/xanh dương/cam = chốt lời tại 10/20/30 nến xanh
+            </div>
+            <div style={{ width: "100%", height: 190 }}>
+              <ResponsiveContainer>
+                <LineChart data={chartData} margin={{ top: 4, right: 6, bottom: 0, left: 0 }}>
+                  <Line dataKey="bh" name="bh" stroke="#9aa5c0" strokeDasharray="5 4" dot={false} strokeWidth={1.4} isAnimationActive={false} connectNulls />
+                  <Line dataKey="never" name="never" stroke={colorOf.never} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls />
+                  <Line dataKey="g10" name="g10" stroke={colorOf.g10} dot={false} strokeWidth={1.4} isAnimationActive={false} connectNulls />
+                  <Line dataKey="g20" name="g20" stroke={colorOf.g20} dot={false} strokeWidth={1.4} isAnimationActive={false} connectNulls />
+                  <Line dataKey="g30" name="g30" stroke={colorOf.g30} dot={false} strokeWidth={1.4} isAnimationActive={false} connectNulls />
+                  <XAxis dataKey="d" hide />
+                  <YAxis hide domain={["auto", "auto"]} />
+                  <ReferenceLine y={capital.value} stroke={CLR.line} label={{ value: "vốn gốc", fill: CLR.mut, fontSize: 10, position: "insideBottomLeft" }} />
+                  <Tooltip contentStyle={TT} formatter={(val, nm) => [fmtMoney(val), nmMap[nm] || nm]} labelStyle={{ color: CLR.blue }} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+            <p className="sub" style={{ marginTop: 10, fontSize: 11 }}>
+              ⚠ Mô phỏng ở nhịp THÁNG (không quét SL trong phiên như luật
+              CMT×Trend), coi khớp đúng giá Stop/giá đóng cửa tháng, chưa trừ
+              phí/thuế/trượt giá. Sharpe tính trên chuỗi lợi nhuận theo tháng
+              (quy đổi ×√12), không cùng thước với Sharpe theo ngày ở các
+              phần khác.
+            </p>
+          </Panel>
+        );
+      })()}
+
       <Panel
         mod="Hurst · Xếp hạng chỉ báo"
         title={`${cfg.label} — họ chỉ báo ${isTrend ? "TREND (kể cả Volume)" : "OSCILLATOR"}`}
@@ -8860,7 +9142,8 @@ export default function App() {
       resolvedDir,
       cfg.digits,
       stockData.highs,
-      stockData.lows
+      stockData.lows,
+      stockData.opens
     );
     if (hurstCache.current.size > 8) hurstCache.current.clear();
     hurstCache.current.set(key, res);
