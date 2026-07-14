@@ -3758,6 +3758,10 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
     live,
     start,
     warmupFromDate: dates[start],
+    // Danh sách lot ĐANG MỞ tại thời điểm cuối dữ liệu (chưa có exit) — cần
+    // riêng để ghép vào "nhật ký tín hiệu" thực chiến bên dưới, vì mảng
+    // trades chỉ ghi nhận các lot ĐÃ ĐÓNG.
+    openLots: pos ? pos.lots.map((l) => ({ idx: l.idx, price: l.price })) : [],
     allIn: {
       dailyReturns: aiDaily,
       finalMultiple: aiEquity,
@@ -3770,7 +3774,7 @@ function runCMTHurstLongRule(closes, highs, lows, volumes, dates, opts) {
 // Gói thống kê đầy đủ (tradeStats/winLoss/equity/theo đoạn/theo trạng thái
 // CMT lúc vào/Buy&Hold/live) từ danh sách lệnh thô của runCMTHurstLongRule.
 function summarizeRuleBacktest(engine, closes, dates, opts) {
-  const { trades, live, start, allIn } = engine;
+  const { trades, live, start, allIn, openLots } = engine;
   const n = closes.length;
   const sim = simulateEquityDaily(trades, closes, n, opts.riskPct);
   let cum = 0;
@@ -3835,6 +3839,69 @@ function summarizeRuleBacktest(engine, closes, dates, opts) {
       pctInMarket: allInStats.pctInMarket,
     },
     live,
+    openLots,
+  };
+}
+
+// ============================================================
+// NHẬT KÝ TÍN HIỆU THỰC CHIẾN — thay vì đo R-multiple/Sharpe trừu tượng,
+// đây là góc nhìn "nếu tôi bỏ đúng X đồng mỗi lần hệ thống báo vào lệnh"
+// (số tiền CỐ ĐỊNH do người dùng tự chọn, không phải % rủi ro): liệt kê
+// TỪNG lần vào lệnh trong quá khứ — ngày nào, giá nào, đóng ngày nào, lời/
+// lỗ bao nhiêu đồng — và tổng lời/lỗ cộng dồn. Đây là cách "người dùng
+// thường" hiểu được ngay, không cần biết R-multiple hay Sharpe là gì.
+// ============================================================
+function buildSignalLog(cb, closes, dates, cashPerEntry) {
+  if (!cb) return null;
+  const lastPrice = closes[closes.length - 1];
+  const lastDate = dates[dates.length - 1];
+  const closedRows = (cb.trades || []).map((t) => {
+    const mult = t.exitPrice / t.entryPrice;
+    return {
+      entryIdx: t.entryIdx,
+      entryDate: dates[t.entryIdx],
+      entryPrice: t.entryPrice,
+      exitDate: dates[t.exitIdx],
+      exitPrice: t.exitPrice,
+      reason: t.exitReason,
+      closed: true,
+      pnlVnd: cashPerEntry * (mult - 1),
+      pnlPct: (mult - 1) * 100,
+    };
+  });
+  const openRows = (cb.openLots || []).map((l) => {
+    const mult = lastPrice / l.price;
+    return {
+      entryIdx: l.idx,
+      entryDate: dates[l.idx],
+      entryPrice: l.price,
+      exitDate: null,
+      exitPrice: lastPrice,
+      reason: "open",
+      closed: false,
+      pnlVnd: cashPerEntry * (mult - 1),
+      pnlPct: (mult - 1) * 100,
+    };
+  });
+  const rows = [...closedRows, ...openRows].sort((a, b) => a.entryIdx - b.entryIdx);
+  let cum = 0;
+  rows.forEach((r) => {
+    cum += r.pnlVnd;
+    r.cumVnd = cum;
+  });
+  const totalInvested = rows.length * cashPerEntry;
+  const totalPnl = cum;
+  const wins = rows.filter((r) => r.pnlVnd > 0).length;
+  return {
+    rows,
+    lastDate,
+    cashPerEntry,
+    totalInvested,
+    totalPnl,
+    totalPnlPct: totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0,
+    winCount: wins,
+    lossCount: rows.length - wins,
+    hitRate: rows.length ? (wins / rows.length) * 100 : NaN,
   };
 }
 
@@ -8008,6 +8075,7 @@ const REGIME_STRAT = {
 function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate }) {
   const [profitView, setProfitView] = React.useState("combined");
   const [dcaMode, setDcaMode] = React.useState("everyMonth");
+  const [cashPerEntry, setCashPerEntry] = React.useState(10000000);
   if (!detail)
     return (
       <Panel mod="Hurst" title="Đang chạy walk-forward…" sub="Đối chiếu trạng thái CMT với Hurst cho mã đang chọn." />
@@ -8668,6 +8736,98 @@ function HurstTab({ cfg, dir, opts, setOpts, detail, capital, riskPctIn, gate })
                 </div>
               </>
             )}
+          </Panel>
+        );
+      })()}
+
+      {(() => {
+        const cb = d.cardBacktest;
+        if (!cb || cb.trades.length < 1) return null;
+        const log = buildSignalLog(cb, d.closes, d.dates, cashPerEntry);
+        const reasonVN = {
+          sl: "dính SL",
+          tp_partial: "chạm TP (chốt 50%)",
+          flip: "vỡ hỗ trợ tháng",
+          wflip: "xu hướng tuần gãy",
+          timeout: "hết hạn",
+          open: "ĐANG GIỮ",
+        };
+        return (
+          <Panel
+            mod="Hurst · Nhật ký tín hiệu thực chiến"
+            title={`${cfg.label} — nếu mỗi lần hệ thống báo vào lệnh, bạn bỏ đúng số tiền dưới đây thì sao?`}
+            sub="Bỏ qua R-multiple/Sharpe — đây là góc nhìn trực tiếp: LIỆT KÊ TỪNG LẦN hệ thống báo vào lệnh trong quá khứ (đúng ngày, đúng giá), giả định mỗi lần bạn bỏ ra CÙNG một số tiền cố định (không phải % rủi ro), rồi cộng dồn lời/lỗ thật theo VND. Tự chỉnh số tiền mỗi lần vào lệnh bên dưới cho khớp với khả năng/nguyện vọng thật của bạn."
+          >
+            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 12 }}>
+              <div>
+                <label className="lb">Số tiền mỗi lần vào lệnh (VND)</label>
+                <input
+                  className="inp"
+                  style={{ width: 160 }}
+                  type="number"
+                  step="1000000"
+                  min="100000"
+                  value={cashPerEntry}
+                  onChange={(e) => setCashPerEntry(Math.max(100000, +e.target.value || 10000000))}
+                />
+              </div>
+              <div className="sub">
+                = {log.rows.length} lần vào lệnh × {fmtMoney(cashPerEntry)} = tổng {fmtMoney(log.totalInvested)} đã bỏ ra qua toàn bộ lịch sử (không phải bỏ 1 lần — trải dài từ {log.rows[0]?.entryDate} tới nay)
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+              <MetricBox
+                label="Tổng lời/lỗ cộng dồn"
+                value={`${log.totalPnl >= 0 ? "+" : ""}${fmtMoney(log.totalPnl)}`}
+                color={log.totalPnl >= 0 ? CLR.bull : CLR.bear}
+                sub={`${log.totalPnlPct >= 0 ? "+" : ""}${log.totalPnlPct.toFixed(1)}% trên tổng số tiền đã bỏ ra`}
+              />
+              <MetricBox label="Số lần vào lệnh" value={log.rows.length} sub={`${log.winCount} lần lời · ${log.lossCount} lần lỗ`} />
+              <MetricBox label="Tỷ lệ lời" value={isFinite(log.hitRate) ? log.hitRate.toFixed(0) + "%" : "—"} />
+            </div>
+            <div style={{ maxHeight: 420, overflowY: "auto" }}>
+              <table className="tbl">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Ngày vào</th>
+                    <th>Giá vào</th>
+                    <th>Ngày ra</th>
+                    <th>Giá ra</th>
+                    <th>Lý do ra</th>
+                    <th>Lời/lỗ</th>
+                    <th>Cộng dồn</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {log.rows.map((r, i) => (
+                    <tr key={i} style={r.closed ? {} : { background: "#1a2440" }}>
+                      <td className="num">{i + 1}</td>
+                      <td className="num">{r.entryDate}</td>
+                      <td className="num">{priceTxt(r.entryPrice)}</td>
+                      <td className="num">{r.closed ? r.exitDate : `${log.lastDate} (đang giữ)`}</td>
+                      <td className="num">{priceTxt(r.exitPrice)}</td>
+                      <td>{reasonVN[r.reason] || r.reason}</td>
+                      <td className="num" style={{ color: r.pnlVnd >= 0 ? CLR.bull : CLR.bear, fontWeight: 700 }}>
+                        {r.pnlVnd >= 0 ? "+" : ""}{fmtMoney(r.pnlVnd)} ({r.pnlPct >= 0 ? "+" : ""}{r.pnlPct.toFixed(1)}%)
+                      </td>
+                      <td className="num" style={{ color: r.cumVnd >= 0 ? CLR.bull : CLR.bear }}>
+                        {r.cumVnd >= 0 ? "+" : ""}{fmtMoney(r.cumVnd)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="sub" style={{ marginTop: 10, fontSize: 11 }}>
+              ⚠ Mỗi dòng giả định một khoản tiền MỚI, ĐỘC LẬP — không phải
+              vốn quay vòng từ lần trước, nên đây là góc nhìn "nếu có sẵn
+              từng đó tiền mặt mỗi lần" chứ không phải một tài khoản duy
+              nhất tăng trưởng theo thời gian (muốn xem tài khoản thật lớn
+              dần theo thời gian, xem đường DỒN TOÀN BỘ VỐN ở panel phía
+              trên). Dòng nền tối = lệnh còn đang mở, lời/lỗ tính theo giá
+              hiện tại, sẽ đổi khi giá đổi.
+            </p>
           </Panel>
         );
       })()}
